@@ -1,23 +1,10 @@
-import subprocess
-import sys
-
-def install(package):
-    try:
-        subprocess.check_call([sys.executable, "-m", "pip", "install", package])
-    except Exception:
-        pass
-
-try:
-    import yfinance as yf
-except ImportError:
-    install("yfinance>=0.2.0")
-    import yfinance as yf
-
-try:
-    import openpyxl
-except ImportError:
-    install("openpyxl")
-    import openpyxl
+import streamlit as st
+import pandas as pd
+import yfinance as yf
+import io
+import openpyxl
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.formatting.rule import CellIsRule
 
 import streamlit as st
 import pandas as pd
