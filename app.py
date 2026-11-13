@@ -6,16 +6,10 @@ import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.formatting.rule import CellIsRule
 
-import streamlit as st
-import pandas as pd
-import io
-from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
-from openpyxl.formatting.rule import CellIsRule
-
 st.set_page_config(page_title="Anti-Fragile Valuation & Startup Audit Suite", page_icon="📈", layout="wide")
 
 st.title("📈 Anti-Fragile Stock & Startup Evaluation Suite")
-st.markdown("Generate institutional-grade 16-pillar Excel scorecards, live market valuations, or startup unit-economics audits instantly.")
+st.markdown("Generate institutional-grade 16-pillar scorecards, live market valuations, or startup unit-economics audits instantly.")
 
 # Sidebar navigation
 app_mode = st.sidebar.selectbox("Select Evaluation Model", ["Public Stock Evaluator", "Pre-Profit Startup Evaluator"])
@@ -69,42 +63,6 @@ if app_mode == "Public Stock Evaluator":
                 score_44 = 4
                 score_45 = 5 if "BUY" in analyst_rec else 3
 
-                # Excel Workbook Generation
-                wb = openpyxl.Workbook()
-                ws1 = wb.active
-                ws1.title = "Established Companies"
-                ws1.views.sheetView[0].showGridLines = True
-
-                TITLE_FONT = Font(name="Calibri", size=16, bold=True, color="0F172A")
-                SUB_FONT = Font(name="Calibri", size=12, italic=True, color="64748B")
-                HEADER_FILL = PatternFill(start_color="1E293B", end_color="1E293B", fill_type="solid")
-                HEADER_FONT = Font(name="Calibri", size=13, bold=True, color="FFFFFF")
-                ROW_FONT = Font(name="Calibri", size=12)
-                BOLD_FONT = Font(name="Calibri", size=12, bold=True, color="0F172A")
-                GREEN_FONT = Font(name="Calibri", size=12, bold=True, color="166534")
-                AMBER_FONT = Font(name="Calibri", size=12, bold=True, color="B45309")
-                RED_FONT = Font(name="Calibri", size=12, bold=True, color="991B1B")
-
-                ALIGN_LEFT = Alignment(horizontal="left", vertical="center", wrap_text=True)
-                ALIGN_CENTER = Alignment(horizontal="center", vertical="center", wrap_text=True)
-                BORDER_THIN = Border(left=Side(style="thin", color="CBD5E1"), right=Side(style="thin", color="CBD5E1"), top=Side(style="thin", color="CBD5E1"), bottom=Side(style="thin", color="CBD5E1"))
-
-                ws1["A1"] = f"Anti-Fragile Stock Evaluation Framework ({company_name})"
-                ws1["A1"].font = TITLE_FONT
-                ws1["A3"] = f"Company / Ticker: {company_name} ({ticker})"
-                ws1["A3"].font = BOLD_FONT
-                ws1["A4"] = f"Evaluation Date: 2026-11-13 | Consensus: {analyst_rec} ({num_analysts} Analysts)"
-                ws1["A4"].font = SUB_FONT
-
-                headers = ["Ref #", "Category", "Evaluation Metric / Criteria", "Target Threshold", "Weight", "Company Value / Metric", "Score (1-5)", "Weighted Score", "Pass / Fail / Neutral", "Notes / Remarks"]
-                ws1.row_dimensions[6].height = 32
-                for col_idx, h in enumerate(headers, 1):
-                    c = ws1.cell(row=6, column=col_idx, value=h)
-                    c.fill = HEADER_FILL
-                    c.font = HEADER_FONT
-                    c.alignment = ALIGN_CENTER
-                    c.border = BORDER_THIN
-
                 pillars_data = [
                     ("1.1", "Economic Moat", "Competitive Advantage", "Brand Moat & Pricing Power", 0.06, f"Gross Margin: {gm_val*100:.1f}%", score_11, "Strong moat characteristics"),
                     ("1.2", "Economic Moat", "Market Dynamics", "TAM Expansion", 0.06, f"Revenue Growth: {rg_val*100:.1f}% YoY", score_12, "Market growth"),
@@ -124,101 +82,60 @@ if app_mode == "Public Stock Evaluator":
                     ("4.5", "Expert Opinion", "Wall Street Analyst Consensus", "Strong Buy / Buy", 0.06, f"Consensus: {analyst_rec} (${fair_value:,.2f} Target)", score_45, "Wall Street backing")
                 ]
 
-                for idx, row in enumerate(pillars_data, 7):
-                    ws1.row_dimensions[idx].height = 28
-                    ws1.cell(row=idx, column=1, value=row[0]).alignment = ALIGN_CENTER
-                    ws1.cell(row=idx, column=2, value=row[1]).alignment = ALIGN_LEFT
-                    ws1.cell(row=idx, column=3, value=row[2]).alignment = ALIGN_LEFT
-                    ws1.cell(row=idx, column=4, value=row[3]).alignment = ALIGN_LEFT
-                    
-                    c_weight = ws1.cell(row=idx, column=5, value=row[4])
-                    c_weight.number_format = "0.0%"
-                    c_weight.alignment = ALIGN_CENTER
-                    
-                    ws1.cell(row=idx, column=6, value=row[5]).alignment = ALIGN_LEFT
-                    
-                    c_score = ws1.cell(row=idx, column=7, value=row[6])
-                    c_score.alignment = ALIGN_CENTER
-                    c_score.font = BOLD_FONT
-                    
-                    c_weighted = ws1.cell(row=idx, column=8, value=f"=G{idx}*E{idx}")
-                    c_weighted.number_format = "0.00"
-                    c_weighted.alignment = ALIGN_CENTER
-                    
-                    c_pass = ws1.cell(row=idx, column=9, value=f'=IF(G{idx}>=4, "PASS", IF(G{idx}=3, "NEUTRAL", "FAIL"))')
-                    c_pass.alignment = ALIGN_CENTER
-                    c_pass.font = BOLD_FONT
-                    
-                    c_notes = ws1.cell(row=idx, column=10, value=row[7])
-                    c_notes.alignment = ALIGN_LEFT
+                # Calculate overall metrics for browser UI
+                total_weighted_score = sum(row[4] * row[6] for row in pillars_data)
+                margin_of_safety = 0.20
+                target_buy_price = fair_value * (1 - margin_of_safety)
+                is_in_buy_zone = cmp <= target_buy_price
+                upside_pct = ((fair_value - cmp) / cmp) * 100
 
-                    for col in range(1, 11):
-                        if col != 7 and col != 9:
-                            ws1.cell(row=idx, column=col).font = ROW_FONT
-                        ws1.cell(row=idx, column=col).border = BORDER_THIN
+                # --- BROWSER UI DISPLAY ---
+                st.divider()
+                st.markdown(f"### 📊 {company_name} ({ticker})")
+                st.caption(f"Wall Street Consensus: **{analyst_rec}** ({num_analysts} Analysts)")
 
-                ws1.conditional_formatting.add("I7:I22", CellIsRule(operator="equal", formula=["\"PASS\""], stopIfTrue=True, font=GREEN_FONT))
-                ws1.conditional_formatting.add("I7:I22", CellIsRule(operator="equal", formula=["\"NEUTRAL\""], stopIfTrue=True, font=AMBER_FONT))
-                ws1.conditional_formatting.add("I7:I22", CellIsRule(operator="equal", formula=["\"FAIL\""], stopIfTrue=True, font=RED_FONT))
+                # Key Metrics Grid
+                col1, col2, col3, col4 = st.columns(2)
+                col1.metric("Current Price", f"${cmp:,.2f}")
+                col2.metric("Fair Value Target", f"${fair_value:,.2f}", f"{upside_pct:+.1f}% Upside")
+                col3.metric("Max Buy Price (20% MoS)", f"${target_buy_price:,.2f}")
+                col4.metric("16-Pillar Score", f"{total_weighted_score:.2f} / 5.00")
 
-                ws1.row_dimensions[24].height = 30
-                ws1.cell(row=24, column=3, value="OVERALL SCORE & WEIGHTED TOTAL").font = BOLD_FONT
-                ws1.cell(row=24, column=3).alignment = Alignment(horizontal="right", vertical="center")
-                c_tot = ws1.cell(row=24, column=8, value="=SUM(H7:H22)")
-                c_tot.font = BOLD_FONT
-                c_tot.number_format = "0.00"
-                c_tot.alignment = ALIGN_CENTER
+                # Buy Zone Status Banner
+                if is_in_buy_zone:
+                    st.success(f"🟢 **IN BUY ZONE** — Trading below your ${target_buy_price:,.2f} margin-of-safety threshold.")
+                else:
+                    st.warning(f"🟡 **WAIT FOR DIP** — Trading ${cmp - target_buy_price:,.2f} above your${target_buy_price:,.2f} target buy price.")
 
-                # Valuation Calculator
-                ws1.cell(row=26, column=2, value="VALUATION & TARGET BUY PRICE CALCULATOR").font = BOLD_FONT
-                val_headers = ["Valuation Method", "Current Market Price", "Fair Value Estimate", "Margin of Safety Required", "Target Max Buy Price", "Status vs Current Price"]
-                ws1.row_dimensions[27].height = 28
-                for col_idx, vh in enumerate(val_headers, 2):
-                    c = ws1.cell(row=27, column=col_idx, value=vh)
-                    c.fill = HEADER_FILL
-                    c.font = HEADER_FONT
-                    c.alignment = ALIGN_CENTER
-                    c.border = BORDER_THIN
+                # Build DataFrame for Interactive Browser Table
+                df_rows = []
+                for r in pillars_data:
+                    status_label = "🟢 PASS" if r[6] >= 4 else ("🟡 NEUTRAL" if r[6] == 3 else "🔴 FAIL")
+                    df_rows.append({
+                        "Ref": r[0],
+                        "Category": r[1],
+                        "Metric": r[2],
+                        "Company Value": r[5],
+                        "Score": f"{r[6]}/5",
+                        "Weight": f"{r[4]*100:.0f}%",
+                        "Weighted": round(r[4] * r[6], 2),
+                        "Status": status_label,
+                        "Notes": r[7]
+                    })
+                
+                df_display = pd.DataFrame(df_rows)
+                st.markdown("#### 📋 16-Pillar Audit Breakdown")
+                st.dataframe(df_display, use_container_width=True, hide_index=True)
 
-                ws1.row_dimensions[28].height = 26
-                ws1.cell(row=28, column=2, value="Discounted Fair Value Model").alignment = ALIGN_LEFT
-                ws1.cell(row=28, column=3, value=cmp).number_format = "$#,##0.00"
-                ws1.cell(row=28, column=4, value=fair_value).number_format = "$#,##0.00"
-                ws1.cell(row=28, column=5, value=0.20).number_format = "0.0%"
-                target_cell = ws1.cell(row=28, column=6, value="=D28*(1-E28)")
-                target_cell.number_format = "$#,##0.00"
-                target_cell.font = BOLD_FONT
-                status_cell = ws1.cell(row=28, column=7, value='=IF(C28<=F28, "IN BUY ZONE", "WAIT FOR DIP")')
-                status_cell.font = BOLD_FONT
+                # --- EXCEL WORKBOOK GENERATION ---
+                wb = openpyxl.Workbook()
+                ws1 = wb.active
+                ws1.title = "Established Companies"
+                ws1.views.sheetView[0].showGridLines = True
 
-                for col in range(2, 8):
-                    ws1.cell(row=28, column=col).border = BORDER_THIN
-
-                output = io.BytesIO()
-                wb.save(output)
-                output.seek(0)
-
-                st.success(f"Successfully evaluated **{company_name} ({ticker})**!")
-                st.metric(label="Current Market Price", value=f"${cmp:,.2f}")
-                st.metric(label="Fair Value Estimate", value=f"${fair_value:,.2f}")
-                st.download_button(
-                    label="📥 Download Excel Scorecard",
-                    data=output,
-                    file_name=f"{ticker}_Evaluated_Scorecard.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                )
-            except Exception as e:
-                st.error(f"Error fetching data for {ticker}: {e}")
-
-elif app_mode == "Pre-Profit Startup Evaluator":
-    st.subheader("🚀 Pre-Profit Startup Unit Economics Evaluator")
-    startup_name = st.text_input("Startup Name:", value="SaaSCo")
-    arr_growth = st.slider("YoY ARR Growth Rate (%)", 10, 200, 85) / 100.0
-    burn_multiple = st.slider("Burn Multiple (Net Burn / New ARR)", 0.5, 3.0, 1.2, 0.1)
-    runway_months = st.slider("Cash Runway (Months)", 3, 36, 22)
-    ltv_cac = st.slider("LTV / CAC Ratio", 1.0, 8.0, 4.2, 0.1)
-
-    if st.button("Generate Startup Audit"):
-        st.success(f"Generated unit-economics audit for **{startup_name}**!")
-        st.metric("Venture Burn Health", "Healthy" if burn_multiple <= 1.5 else "High Risk")
-
+                TITLE_FONT = Font(name="Calibri", size=16, bold=True, color="0F172A")
+                SUB_FONT = Font(name="Calibri", size=12, italic=True, color="64748B")
+                HEADER_FILL = PatternFill(start_color="1E293B", end_color="1E293B", fill_type="solid")
+                HEADER_FONT = Font(name="Calibri", size=13, bold=True, color="FFFFFF")
+                ROW_FONT = Font(name="Calibri", size=12)
+                BOLD_
