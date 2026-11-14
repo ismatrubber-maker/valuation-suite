@@ -310,4 +310,4 @@ elif app_mode == "Pre-Profit Startup Evaluator":
         m4.metric("Weighted Score", f"{weighted_total:.2f} / 5.00")
 
         st.download_button(label=f"📥 Download {startup_name} Audit Scorecard", data=excel_file, file_name=f"{clean_filename}_Startup_Evaluation_Framework.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-EOF
+
