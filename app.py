@@ -1,6 +1,7 @@
 import streamlit as st
 import yfinance as yf
 import io
+import pandas as pd
 from datetime import datetime
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
@@ -14,16 +15,15 @@ st.set_page_config(
 )
 
 st.title("📈 Anti-Fragile Stock & Startup Evaluation Suite")
-st.markdown("Generate institutional-grade 16-pillar Excel scorecards with live market data, conditional formatting, and buy-zone / burn-health calculators.")
+st.markdown("Generate institutional-grade 16-pillar scorecards, inspect results instantly on-screen, and export professional Excel audits.")
 
-# Shared Excel Styling & Builder Function
+# Shared Excel Builder Function
 def build_excel_report(sheet_title, main_title, entity_line, sub_line, pillars_data, calc_title, calc_headers, calc_row_values, calc_formats):
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = sheet_title
     ws.views.sheetView[0].showGridLines = True
 
-    # Styles
     TITLE_FONT = Font(name="Calibri", size=16, bold=True, color="0F172A")
     SUB_FONT = Font(name="Calibri", size=12, italic=True, color="64748B")
     HEADER_FILL = PatternFill(start_color="1E293B", end_color="1E293B", fill_type="solid")
@@ -38,13 +38,10 @@ def build_excel_report(sheet_title, main_title, entity_line, sub_line, pillars_d
     ALIGN_LEFT = Alignment(horizontal="left", vertical="center", wrap_text=True)
     ALIGN_CENTER = Alignment(horizontal="center", vertical="center", wrap_text=True)
     BORDER_THIN = Border(
-        left=Side(style="thin", color="CBD5E1"),
-        right=Side(style="thin", color="CBD5E1"),
-        top=Side(style="thin", color="CBD5E1"),
-        bottom=Side(style="thin", color="CBD5E1")
+        left=Side(style="thin", color="CBD5E1"), right=Side(style="thin", color="CBD5E1"),
+        top=Side(style="thin", color="CBD5E1"), bottom=Side(style="thin", color="CBD5E1")
     )
 
-    # Header Block
     ws["A1"] = main_title
     ws["A1"].font = TITLE_FONT
     ws["A3"] = entity_line
@@ -52,12 +49,7 @@ def build_excel_report(sheet_title, main_title, entity_line, sub_line, pillars_d
     ws["A4"] = sub_line
     ws["A4"].font = SUB_FONT
 
-    # Main Table Headers
-    headers = [
-        "Ref #", "Category", "Evaluation Metric / Criteria", "Target Threshold",
-        "Weight", "Company Value / Metric", "Score (1-5)", "Weighted Score",
-        "Pass / Fail / Neutral", "Notes / Remarks"
-    ]
+    headers = ["Ref #", "Category", "Evaluation Metric / Criteria", "Target Threshold", "Weight", "Company Value / Metric", "Score (1-5)", "Weighted Score", "Pass / Fail / Neutral", "Notes / Remarks"]
     ws.row_dimensions[6].height = 32
     for col_idx, h in enumerate(headers, 1):
         c = ws.cell(row=6, column=col_idx, value=h)
@@ -66,7 +58,6 @@ def build_excel_report(sheet_title, main_title, entity_line, sub_line, pillars_d
         c.alignment = ALIGN_CENTER
         c.border = BORDER_THIN
 
-    # Populate 16 Pillars
     for idx, row in enumerate(pillars_data, 7):
         ws.row_dimensions[idx].height = 28
         ws.cell(row=idx, column=1, value=row[0]).alignment = ALIGN_CENTER
@@ -100,12 +91,10 @@ def build_excel_report(sheet_title, main_title, entity_line, sub_line, pillars_d
                 ws.cell(row=idx, column=col).font = ROW_FONT
             ws.cell(row=idx, column=col).border = BORDER_THIN
 
-    # Conditional Formatting
     ws.conditional_formatting.add("I7:I22", CellIsRule(operator="equal", formula=['"PASS"'], stopIfTrue=True, font=GREEN_FONT))
     ws.conditional_formatting.add("I7:I22", CellIsRule(operator="equal", formula=['"NEUTRAL"'], stopIfTrue=True, font=AMBER_FONT))
     ws.conditional_formatting.add("I7:I22", CellIsRule(operator="equal", formula=['"FAIL"'], stopIfTrue=True, font=RED_FONT))
 
-    # Overall Score Row
     ws.row_dimensions[24].height = 30
     ws.cell(row=24, column=3, value="OVERALL SCORE & WEIGHTED TOTAL").font = BOLD_FONT
     ws.cell(row=24, column=3).alignment = Alignment(horizontal="right", vertical="center")
@@ -114,7 +103,6 @@ def build_excel_report(sheet_title, main_title, entity_line, sub_line, pillars_d
     c_tot.number_format = "0.00"
     c_tot.alignment = ALIGN_CENTER
 
-    # Bottom Calculator Section
     ws.cell(row=26, column=2, value=calc_title).font = BOLD_FONT
     ws.row_dimensions[27].height = 28
     for col_idx, vh in enumerate(calc_headers, 2):
@@ -133,7 +121,6 @@ def build_excel_report(sheet_title, main_title, entity_line, sub_line, pillars_d
         c.font = BOLD_FONT if is_bold else ROW_FONT
         c.border = BORDER_THIN
 
-    # Column Widths
     widths = {"A": 10, "B": 28, "C": 28, "D": 26, "E": 22, "F": 32, "G": 20, "H": 16, "I": 20, "J": 38}
     for col_letter, w in widths.items():
         ws.column_dimensions[col_letter].width = w
@@ -143,14 +130,9 @@ def build_excel_report(sheet_title, main_title, entity_line, sub_line, pillars_d
     output.seek(0)
     return output
 
-
-# Sidebar Mode Selection
 app_mode = st.sidebar.selectbox("Select Evaluation Model", ["Public Stock Evaluator", "Pre-Profit Startup Evaluator"])
 today_str = datetime.now().strftime("%Y-%m-%d")
 
-# ==========================================
-# MODE 1: PUBLIC STOCK EVALUATOR
-# ==========================================
 if app_mode == "Public Stock Evaluator":
     st.subheader("🏢 Public Listed Company Valuation Engine")
     col_in1, col_in2 = st.columns([2, 1])
@@ -160,132 +142,115 @@ if app_mode == "Public Stock Evaluator":
         mos_pct = st.number_input("Margin of Safety Required (%):", min_value=0, max_value=60, value=20, step=5) / 100.0
 
     if st.button("Generate Stock Scorecard", type="primary"):
-        if not ticker:
-            st.warning("Please enter a valid ticker symbol.")
-        else:
-            with st.spinner(f"Fetching live market data and computing 16-pillar audit for {ticker}..."):
+        with st.spinner(f"Analyzing {ticker}..."):
+            try:
+                stock = yf.Ticker(ticker)
+                todays_data = stock.history(period="1d")
+                cmp = float(todays_data["Close"].iloc[-1]) if not todays_data.empty else float(stock.fast_info.last_price)
+
+                info = stock.info or {}
+                company_name = info.get("longName") or info.get("shortName") or ticker
+                fair_value = float(info.get("targetMeanPrice")) if info.get("targetMeanPrice") else round(cmp * 1.25, 2)
+                analyst_rec = (info.get("recommendationKey") or "BUY").upper().replace("_", " ")
+                num_analysts = info.get("numberOfAnalystOpinions") or 10
+
+                gm_val = info.get("grossMargins", 0.50) if info.get("grossMargins") is not None else 0.50
+                roe_val = info.get("returnOnEquity", 0.20) if info.get("returnOnEquity") is not None else 0.20
+                de_val = info.get("debtToEquity", 50.0) if info.get("debtToEquity") is not None else 50.0
+                rg_val = info.get("revenueGrowth", 0.10) if info.get("revenueGrowth") is not None else 0.10
+                fcf_val = info.get("freeCashflow", 1000000000) if info.get("freeCashflow") is not None else 1000000000
+                net_income_val = info.get("netIncomeToCommon", 1000000000) if info.get("netIncomeToCommon") is not None else 1000000000
+                pe_val = info.get("trailingPE", 20.0) if info.get("trailingPE") is not None else 20.0
+                peg_val = info.get("pegRatio", 1.5) if info.get("pegRatio") is not None else 1.5
+                insider_val = (info.get("heldPercentInsiders") * 100) if info.get("heldPercentInsiders") is not None else 3.0
+
+                insider_action = "Stable / Neutral"
                 try:
-                    stock = yf.Ticker(ticker)
-                    todays_data = stock.history(period="1d")
-                    if not todays_data.empty:
-                        cmp = float(todays_data["Close"].iloc[-1])
-                    else:
-                        cmp = float(stock.fast_info.last_price)
+                    insider_txns = stock.insider_transactions
+                    if insider_txns is not None and not insider_txns.empty and "Shares" in insider_txns.columns:
+                        recent_net = insider_txns["Shares"].head(5).sum()
+                        if recent_net > 0: insider_action = "Net Open-Market Buyers"
+                        elif recent_net < 0: insider_action = "Net Open-Market Sellers"
+                except Exception:
+                    pass
 
-                    info = stock.info or {}
-                    company_name = info.get("longName") or info.get("shortName") or ticker
-                    fair_value = float(info.get("targetMeanPrice")) if info.get("targetMeanPrice") else round(cmp * 1.25, 2)
-                    analyst_rec = (info.get("recommendationKey") or "BUY").upper().replace("_", " ")
-                    num_analysts = info.get("numberOfAnalystOpinions") or 10
+                market_cap = info.get("marketCap") or 0
+                fcf_yield_val = (fcf_val / market_cap) * 100 if market_cap > 0 and fcf_val else 4.0
 
-                    gm_val = info.get("grossMargins") if info.get("grossMargins") is not None else 0.50
-                    roe_val = info.get("returnOnEquity") if info.get("returnOnEquity") is not None else 0.20
-                    de_val = info.get("debtToEquity") if info.get("debtToEquity") is not None else 50.0
-                    rg_val = info.get("revenueGrowth") if info.get("revenueGrowth") is not None else 0.10
-                    fcf_val = info.get("freeCashflow") if info.get("freeCashflow") is not None else 1000000000
-                    net_income_val = info.get("netIncomeToCommon") if info.get("netIncomeToCommon") is not None else 1000000000
-                    pe_val = info.get("trailingPE") if info.get("trailingPE") is not None else 20.0
-                    peg_val = info.get("pegRatio") if info.get("pegRatio") is not None else 1.5
-                    insider_val = (info.get("heldPercentInsiders") * 100) if info.get("heldPercentInsiders") is not None else 3.0
+                score_11 = 5 if gm_val >= 0.50 else (4 if gm_val >= 0.35 else 3)
+                score_12 = 5 if rg_val >= 0.15 else (4 if rg_val >= 0.08 else 3)
+                score_13 = 4
+                score_21 = 5 if roe_val >= 0.20 else (4 if roe_val >= 0.12 else 3)
+                score_22 = score_11
+                score_23 = 5 if de_val < 50 else (4 if de_val < 150 else 3)
+                fcf_net_ratio = (fcf_val / net_income_val) if net_income_val > 0 else 0.5
+                score_24 = 5 if fcf_net_ratio >= 1.0 else (4 if fcf_net_ratio >= 0.75 else 3)
+                score_31 = 5 if fcf_yield_val >= 7.0 else (4 if fcf_yield_val >= 4.0 else 3)
+                score_32 = 5 if (0 < peg_val <= 1.2) else (4 if (1.2 < peg_val <= 2.0) else 3)
+                score_33 = 4
+                score_34 = 5 if insider_val >= 10.0 else (4 if insider_val >= 3.0 else 3)
+                score_41 = score_21
+                score_42 = score_12
+                score_43 = 5 if fcf_val > 0 else 3
+                score_44 = 5 if "Buyers" in insider_action else 4
+                score_45 = 5 if "BUY" in analyst_rec else 3
 
-                    insider_action = "Stable / Neutral"
-                    try:
-                        insider_txns = stock.insider_transactions
-                        if insider_txns is not None and not insider_txns.empty and "Shares" in insider_txns.columns:
-                            recent_net = insider_txns["Shares"].head(5).sum()
-                            if recent_net > 0:
-                                insider_action = "Net Open-Market Buyers"
-                            elif recent_net < 0:
-                                insider_action = "Net Open-Market Sellers"
-                    except Exception:
-                        pass
+                pillars_data = [
+                    ("1.1", "Economic Moat", "Competitive Advantage", "Brand Moat & Pricing Power", 0.06, f"Gross Margin: {gm_val*100:.1f}%", score_11, "Strong moat"),
+                    ("1.2", "Economic Moat", "Market Dynamics", "TAM Expansion", 0.06, f"Revenue Growth: {rg_val*100:.1f}% YoY", score_12, "Market growth"),
+                    ("1.3", "Economic Moat", "Revenue Model Quality", "Recurring mix", 0.06, "Robust revenue quality", score_13, "Stable model"),
+                    ("2.1", "Financial Quality", "ROIC vs WACC Spread", "ROIC exceeds WACC", 0.07, f"ROE / Capital Returns: {roe_val*100:.1f}%", score_21, "Capital efficiency"),
+                    ("2.2", "Financial Quality", "Gross Margin Floor", "Gross Margin > 40%", 0.07, f"Gross Margin: {gm_val*100:.1f}%", score_22, "Reliable margins"),
+                    ("2.3", "Financial Quality", "Debt Leverage", "Net Debt / EBITDA <= 2.0x", 0.07, f"Debt/Equity: {de_val:.1f}%", score_23, "Balance sheet leverage"),
+                    ("2.4", "Financial Quality", "Accrual & FCF Conversion", "FCF / Net Income >= 75%", 0.07, f"FCF/NetInc Ratio: {fcf_net_ratio*100:.1f}%", score_24, "Cash conversion audit"),
+                    ("3.1", "Valuation", "FCF Yield / Valuation", "FCF Yield > 5.0%", 0.07, f"FCF Yield: {fcf_yield_val:.1f}% (CMP: ${cmp:,.2f})", score_31, "Valuation check"),
+                    ("3.2", "Valuation", "PEG Ratio", "PEG 1.0 - 1.5", 0.06, f"PEG Ratio: {peg_val:.2f}x | P/E: {pe_val:.1f}x", score_32, "Growth multiple check"),
+                    ("3.3", "Governance", "Management Alignment", "High executive stake", 0.06, "Active shareholder returns & buybacks", score_33, "Shareholder-friendly execution"),
+                    ("3.4", "Governance", "Insider Ownership %", "Significant skin-in-the-game", 0.05, f"Insider Holding: {insider_val:.1f}%", score_34, "Executive ownership depth"),
+                    ("4.1", "Screening Filters", "5-Year ROIC Trend", "ROIC > 15% 5-yr avg", 0.06, "Consistent multi-year compounding", score_41, "Cycle resilience"),
+                    ("4.2", "Screening Filters", "Top-Line Growth", "Revenue Growth > 8%", 0.06, f"Revenue Growth: {rg_val*100:.1f}% YoY", score_42, "Top-line expansion"),
+                    ("4.3", "Screening Filters", "Maintenance CapEx Efficiency", "Positive FCF", 0.06, f"Free Cash Flow: ${fcf_val:,.0f}", score_43, "Asset efficiency"),
+                    ("4.4", "Screening Filters", "Insider Net Action", "Net open-market buying", 0.06, f"Recent Activity: {insider_action}", score_44, "Insider trading momentum"),
+                    ("4.5", "Expert Opinion", "Wall Street Analyst Consensus", "Strong Buy / Buy", 0.06, f"Consensus: {analyst_rec} (${fair_value:,.2f} Target)", score_45, "Wall Street backing")
+                ]
 
-                    market_cap = info.get("marketCap") or 0
-                    fcf_yield_val = (fcf_val / market_cap) * 100 if market_cap > 0 and fcf_val else 4.0
+                target_buy = fair_value * (1 - mos_pct)
+                in_buy_zone = cmp <= target_buy
+                weighted_total = sum(r[4] * r[6] for r in pillars_data)
 
-                    score_11 = 5 if gm_val >= 0.50 else (4 if gm_val >= 0.35 else (3 if gm_val >= 0.20 else 2))
-                    score_12 = 5 if rg_val >= 0.15 else (4 if rg_val >= 0.08 else (3 if rg_val >= 0.0 else 2))
-                    score_13 = 4
-                    score_21 = 5 if roe_val >= 0.20 else (4 if roe_val >= 0.12 else (3 if roe_val >= 0.05 else 2))
-                    score_22 = score_11
-                    score_23 = 5 if de_val < 50 else (4 if de_val < 150 else (3 if de_val < 300 else 2))
+                # Clean Dashboard Display
+                st.success(f"Audit complete for **{company_name} ({ticker})**!")
+                m1, m2, m3, m4 = st.columns(4)
+                m1.metric("Current Price", f"${cmp:,.2f}")
+                m2.metric("Fair Value", f"${fair_value:,.2f}")
+                m3.metric("Target Buy Price", f"${target_buy:,.2f}", delta="IN BUY ZONE" if in_buy_zone else "WAIT FOR DIP")
+                m4.metric("Weighted Score", f"{weighted_total:.2f} / 5.00")
 
-                    fcf_net_ratio = (fcf_val / net_income_val) if net_income_val > 0 else 0.5
-                    score_24 = 5 if fcf_net_ratio >= 1.0 else (4 if fcf_net_ratio >= 0.75 else (3 if fcf_net_ratio >= 0.5 else 2))
+                # Preview Table on Screen
+                st.markdown("### 📊 16-Pillar Scorecard Preview")
+                df_preview = pd.DataFrame(pillars_data, columns=["Ref", "Category", "Metric", "Threshold", "Weight", "Value", "Score", "Notes"])
+                df_preview["Status"] = df_preview["Score"].apply(lambda x: "PASS" if x >= 4 else ("NEUTRAL" if x == 3 else "FAIL"))
+                st.dataframe(df_preview[["Ref", "Category", "Metric", "Value", "Score", "Status", "Notes"]], use_container_width=True)
 
-                    score_31 = 5 if fcf_yield_val >= 7.0 else (4 if fcf_yield_val >= 4.0 else (3 if fcf_yield_val >= 2.0 else 2))
-                    score_32 = 5 if (0 < peg_val <= 1.2) else (4 if (1.2 < peg_val <= 2.0) else (3 if peg_val > 0 else 2))
-                    score_33 = 4
-                    score_34 = 5 if insider_val >= 10.0 else (4 if insider_val >= 3.0 else (3 if insider_val >= 1.0 else 2))
+                excel_file = build_excel_report(
+                    sheet_title="Established Companies",
+                    main_title=f"Anti-Fragile Stock Evaluation & Risk Audit Framework ({company_name})",
+                    entity_line=f"Company / Ticker: {company_name} ({ticker})",
+                    sub_line=f"Evaluation Date: {today_str} | Consensus: {analyst_rec} ({num_analysts} Analysts)",
+                    pillars_data=pillars_data,
+                    calc_title="VALUATION & TARGET BUY PRICE CALCULATOR",
+                    calc_headers=["Valuation Method", "Current Market Price", "Fair Value Estimate", "Margin of Safety Required", "Target Max Buy Price", "Status vs Current Price"],
+                    calc_row_values=["Discounted Fair Value Model", cmp, fair_value, mos_pct, "=D28*(1-E28)", '=IF(C28<=F28, "IN BUY ZONE", "WAIT FOR DIP")'],
+                    calc_formats={"formats": [None, "$#,##0.00", "$#,##0.00", "0.0%", "$#,##0.00", None], "bold": [False, False, False, False, True, True], "align": ["left", "center", "center", "center", "center", "center"]}
+                )
 
-                    score_41 = score_21
-                    score_42 = score_12
-                    score_43 = 5 if fcf_val > 0 else 3
-                    score_44 = 5 if "Buyers" in insider_action else (4 if "Stable" in insider_action else 3)
-                    score_45 = 5 if ("BUY" in analyst_rec or "OUTPERFORM" in analyst_rec) else (3 if "HOLD" in analyst_rec else 2)
+                st.download_button(label=f"📥 Download {ticker} Excel Scorecard", data=excel_file, file_name=f"{ticker}_Evaluated_Framework_Final.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+            except Exception as e:
+                st.error(f"Error fetching data for '{ticker}': {e}")
 
-                    pillars_data = [
-                        ("1.1", "Economic Moat", "Competitive Advantage", "Brand Moat & Pricing Power", 0.06, f"Gross Margin: {gm_val*100:.1f}%", score_11, "Strong moat characteristics"),
-                        ("1.2", "Economic Moat", "Market Dynamics", "TAM Expansion", 0.06, f"Revenue Growth: {rg_val*100:.1f}% YoY", score_12, "Market growth"),
-                        ("1.3", "Economic Moat", "Revenue Model Quality", "Recurring mix", 0.06, "Robust revenue quality", score_13, "Stable model"),
-                        ("2.1", "Financial Quality", "ROIC vs WACC Spread", "ROIC exceeds WACC", 0.07, f"ROE / Capital Returns: {roe_val*100:.1f}%", score_21, "Capital efficiency"),
-                        ("2.2", "Financial Quality", "Gross Margin Floor", "Gross Margin > 40%", 0.07, f"Gross Margin: {gm_val*100:.1f}%", score_22, "Reliable margins"),
-                        ("2.3", "Financial Quality", "Debt Leverage", "Net Debt / EBITDA <= 2.0x", 0.07, f"Debt/Equity: {de_val:.1f}%", score_23, "Balance sheet leverage"),
-                        ("2.4", "Financial Quality", "Accrual & FCF Conversion", "FCF / Net Income >= 75%", 0.07, f"FCF/NetInc Ratio: {fcf_net_ratio*100:.1f}%", score_24, "Cash conversion audit"),
-                        ("3.1", "Valuation", "FCF Yield / Valuation", "FCF Yield > 5.0%", 0.07, f"FCF Yield: {fcf_yield_val:.1f}% (CMP: ${cmp:,.2f})", score_31, "Valuation check"),
-                        ("3.2", "Valuation", "PEG Ratio", "PEG 1.0 - 1.5", 0.06, f"PEG Ratio: {peg_val:.2f}x | P/E: {pe_val:.1f}x", score_32, "Growth multiple check"),
-                        ("3.3", "Governance", "Management Alignment", "High executive stake", 0.06, "Active shareholder returns & buybacks", score_33, "Shareholder-friendly execution"),
-                        ("3.4", "Governance", "Insider Ownership %", "Significant skin-in-the-game", 0.05, f"Insider Holding: {insider_val:.1f}%", score_34, "Executive ownership depth"),
-                        ("4.1", "Screening Filters", "5-Year ROIC Trend", "ROIC > 15% 5-yr avg", 0.06, "Consistent multi-year compounding", score_41, "Cycle resilience"),
-                        ("4.2", "Screening Filters", "Top-Line Growth", "Revenue Growth > 8%", 0.06, f"Revenue Growth: {rg_val*100:.1f}% YoY", score_42, "Top-line expansion"),
-                        ("4.3", "Screening Filters", "Maintenance CapEx Efficiency", "Positive FCF", 0.06, f"Free Cash Flow: ${fcf_val:,.0f}", score_43, "Asset efficiency"),
-                        ("4.4", "Screening Filters", "Insider Net Action", "Net open-market buying", 0.06, f"Recent Activity: {insider_action}", score_44, "Insider trading momentum"),
-                        ("4.5", "Expert Opinion", "Wall Street Analyst Consensus", "Strong Buy / Buy", 0.06, f"Consensus: {analyst_rec} (${fair_value:,.2f} Target)", score_45, "Wall Street backing")
-                    ]
-
-                    target_buy = fair_value * (1 - mos_pct)
-                    in_buy_zone = cmp <= target_buy
-                    weighted_total = sum(r[4] * r[6] for r in pillars_data)
-
-                    excel_file = build_excel_report(
-                        sheet_title="Established Companies",
-                        main_title=f"Anti-Fragile Stock Evaluation & Risk Audit Framework ({company_name})",
-                        entity_line=f"Company / Ticker: {company_name} ({ticker})",
-                        sub_line=f"Evaluation Date: {today_str} | Consensus: {analyst_rec} ({num_analysts} Analysts)",
-                        pillars_data=pillars_data,
-                        calc_title="VALUATION & TARGET BUY PRICE CALCULATOR",
-                        calc_headers=["Valuation Method", "Current Market Price", "Fair Value Estimate", "Margin of Safety Required", "Target Max Buy Price", "Status vs Current Price"],
-                        calc_row_values=["Discounted Fair Value Model", cmp, fair_value, mos_pct, "=D28*(1-E28)", '=IF(C28<=F28, "IN BUY ZONE", "WAIT FOR DIP")'],
-                        calc_formats={
-                            "formats": [None, "$#,##0.00", "$#,##0.00", "0.0%", "$#,##0.00", None],
-                            "bold": [False, False, False, False, True, True],
-                            "align": ["left", "center", "center", "center", "center", "center"]
-                        }
-                    )
-
-                    st.success(f"Audit complete for **{company_name} ({ticker})**!")
-                    m1, m2, m3, m4 = st.columns(4)
-                    m1.metric("Current Market Price", f"${cmp:,.2f}")
-                    m2.metric("Fair Value Estimate", f"${fair_value:,.2f}")
-                    m3.metric("Target Max Buy Price", f"${target_buy:,.2f}", delta="IN BUY ZONE" if in_buy_zone else "WAIT FOR DIP", delta_color="normal" if in_buy_zone else "inverse")
-                    m4.metric("Weighted Score", f"{weighted_total:.2f} / 5.00")
-
-                    st.download_button(
-                        label=f"📥 Download {ticker} Excel Scorecard",
-                        data=excel_file,
-                        file_name=f"{ticker}_Evaluated_Framework_Final.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                    )
-                except Exception as e:
-                    st.error(f"Could not fetch live data for '{ticker}'. Please verify the ticker symbol. Details: {e}")
-
-# ==========================================
-# MODE 2: PRE-PROFIT STARTUP EVALUATOR
-# ==========================================
 elif app_mode == "Pre-Profit Startup Evaluator":
     st.subheader("🚀 Pre-Profit Startup & Unit Economics Evaluator")
     startup_name = st.text_input("Startup / Venture Name:", value="SaaSCo")
-
     c1, c2, c3 = st.columns(3)
     with c1:
         arr_growth = st.slider("YoY ARR Growth Rate (%)", 0, 250, 85) / 100.0
@@ -307,7 +272,6 @@ elif app_mode == "Pre-Profit Startup Evaluator":
         score_22 = 5 if cac_payback <= 12 else (4 if cac_payback <= 18 else 3)
         score_23 = 5 if gross_margin >= 0.70 else (4 if gross_margin >= 0.50 else 3)
         score_24 = 5 if nrr_val >= 1.10 else (4 if nrr_val >= 1.00 else 3)
-
         score_31 = 5 if burn_multiple <= 1.2 else (4 if burn_multiple <= 1.8 else 3)
         score_32 = 5 if runway_months >= 18 else (4 if runway_months >= 12 else 2)
         score_33 = 5 if rule_of_40 >= 0.40 else (4 if rule_of_40 >= 0.20 else 3)
@@ -337,6 +301,18 @@ elif app_mode == "Pre-Profit Startup Evaluator":
         weighted_total = sum(r[4] * r[6] for r in pillars_data)
         clean_filename = startup_name.replace(" ", "_")
 
+        st.success(f"Unit-economics audit generated for **{startup_name}**!")
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Burn Multiple", f"{burn_multiple:.2f}x")
+        m2.metric("Cash Runway", f"{runway_months} Months")
+        m3.metric("Rule of 40", f"{rule_of_40*100:.0f}%")
+        m4.metric("Weighted Score", f"{weighted_total:.2f} / 5.00")
+
+        st.markdown("### 📊 Startup Scorecard Preview")
+        df_preview = pd.DataFrame(pillars_data, columns=["Ref", "Category", "Metric", "Threshold", "Weight", "Value", "Score", "Notes"])
+        df_preview["Status"] = df_preview["Score"].apply(lambda x: "PASS" if x >= 4 else ("NEUTRAL" if x == 3 else "FAIL"))
+        st.dataframe(df_preview[["Ref", "Category", "Metric", "Value", "Score", "Status", "Notes"]], use_container_width=True)
+
         excel_file = build_excel_report(
             sheet_title="Early-Stage & Pre-Profit",
             main_title=f"Pre-Profit Startup & Unit Economics Evaluation Framework ({startup_name})",
@@ -346,23 +322,7 @@ elif app_mode == "Pre-Profit Startup Evaluator":
             calc_title="STARTUP BURN, RUNWAY & VALUATION HEALTH",
             calc_headers=["Evaluation Metric", "Burn Multiple", "Cash Runway (Mos)", "Rule of 40 Score", "Target Benchmark", "Burn Risk Status"],
             calc_row_values=["Venture Efficiency Model", burn_multiple, runway_months, rule_of_40, "< 1.5x Burn / >= 18m Runway", '=IF(AND(C28<=1.5, D28>=18), "VENTURE HEALTHY", "MONITOR BURN / RUNWAY")'],
-            calc_formats={
-                "formats": [None, "0.00", "0", "0.0%", None, None],
-                "bold": [False, False, False, False, False, True],
-                "align": ["left", "center", "center", "center", "center", "center"]
-            }
+            calc_formats={"formats": [None, "0.00", "0", "0.0%", None, None], "bold": [False, False, False, False, False, True], "align": ["left", "center", "center", "center", "center", "center"]}
         )
 
-        st.success(f"Unit-economics audit generated for **{startup_name}**!")
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("Burn Multiple", f"{burn_multiple:.2f}x", delta="Healthy (<1.5x)" if burn_multiple <= 1.5 else "High Burn", delta_color="normal" if burn_multiple <= 1.5 else "inverse")
-        m2.metric("Cash Runway", f"{runway_months} Months")
-        m3.metric("Rule of 40", f"{rule_of_40*100:.0f}%", delta="Passing (>=40%)" if rule_of_40 >= 0.40 else "Below 40%", delta_color="normal" if rule_of_40 >= 0.40 else "inverse")
-        m4.metric("Weighted Score", f"{weighted_total:.2f} / 5.00")
-
-        st.download_button(
-            label=f"📥 Download {startup_name} Audit Scorecard",
-            data=excel_file,
-            file_name=f"{clean_filename}_Startup_Evaluation_Framework.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        )
+        st.download_button(label=f"📥 Download {startup_name} Audit Scorecard", data=excel_file, file_name=f"{clean_filename}_Startup_Evaluation_Framework.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
