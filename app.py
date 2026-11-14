@@ -1,276 +1,193 @@
-import streamlit as st
-import pandas as pd
-import yfinance as yf
 import io
+from datetime import datetime
 import openpyxl
-from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
-from openpyxl.formatting.rule import CellIsRule
+from openpyxl.formatting.rule import CellIsRule, FormulaRule
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+import streamlit as st
+import yfinance as yf
 
-st.set_page_config(page_title="Anti-Fragile Valuation & Startup Audit Suite", page_icon="📈", layout="wide")
+st.set_page_config(page_title="16-Pillar Evaluator", page_icon="📈", layout="centered")
 
-st.title("📈 Anti-Fragile Stock & Startup Evaluation Suite")
-st.markdown("Generate institutional-grade 16-pillar scorecards, live market valuations, or startup unit-economics audits instantly.")
+st.title("📈 Anti-Fragile 16-Pillar Evaluator")
+ticker_input = st.text_input("Enter Stock Ticker (e.g., CTVA, NVDA, RELIANCE.NS):", value="NVDA").strip().upper()
 
-# Sidebar navigation
-app_mode = st.sidebar.selectbox("Select Evaluation Model", ["Public Stock Evaluator", "Pre-Profit Startup Evaluator"])
+def evaluate_stock(clean_ticker):
+    is_indian = clean_ticker.endswith(".NS") or clean_ticker.endswith(".BO")
+    curr_sym = "₹" if is_indian else "$"
+    today_str = datetime.now().strftime("%Y-%m-%d")
 
-if app_mode == "Public Stock Evaluator":
-    st.subheader("🏢 Public Listed Company Valuation Engine")
-    ticker = st.text_input("Enter Stock Ticker Symbol (e.g., AVGO, TPR, CAT, MSFT):", value="AVGO").strip().upper()
+    stock = yf.Ticker(clean_ticker)
+    info = stock.info or {}
     
-    if st.button("Generate Stock Scorecard"):
-        with st.spinner(f"Fetching live market data and computing valuation for {ticker}..."):
+    # Safe validation to handle invalid, delisted, or missing tickers cleanly
+    if not info or len(info) < 5 or ('regularMarketPrice' in info and info.get('regularMarketPrice') is None and 'currentPrice' in info and info.get('currentPrice') is None):
+        raise ValueError(f"Could not retrieve valid fundamental data for '{clean_ticker}'. It may be invalid, delisted, or temporarily restricted.")
+
+    cmp = info.get('currentPrice') or info.get('regularMarketPrice') or info.get('previousClose') or 100.0
+    company_name = info.get('longName') or info.get('shortName') or clean_ticker
+    sector = info.get('sector', 'Unknown')
+    fair_value = info.get('targetMeanPrice') or round(cmp * 1.25, 2)
+    analyst_rec = (info.get('recommendationKey') or 'HOLD').upper().replace('_', ' ')
+    num_analysts = info.get('numberOfAnalystOpinions', 5)
+
+    gm_val = info.get('grossMargins') or 0.35
+    op_margin = info.get('operatingMargins') or 0.12
+    roe_val = info.get('returnOnEquity') or 0.10
+    de_val = info.get('debtToEquity') or 60.0
+    rg_val = info.get('revenueGrowth') or 0.05
+    eg_val = info.get('earningsGrowth') or 0.05
+
+    fcf_val = info.get('freeCashflow') or 500_000_000
+    net_inc = info.get('netIncomeToCommon') or 500_000_000
+
+    pe_val = info.get('trailingPE') or 20.0
+    fwd_pe_val = info.get('forwardPE') or 18.0
+    peg_val = info.get('pegRatio') or 1.5
+
+    insider_held = info.get('heldPercentInsiders')
+    insider_val = (insider_held * 100) if insider_held is not None else 5.0
+
+    mcap = info.get('marketCap', 1)
+    fcf_yield_val = (fcf_val / mcap) * 100 if (mcap and mcap > 0 and fcf_val) else 3.5
+    insider_action = "Stable / Neutral"
+
+    # 16 Pillars Scoring Logic
+    s11 = 5 if gm_val >= 0.50 else (4 if gm_val >= 0.35 else (3 if gm_val >= 0.20 else 2))
+    s12 = 5 if rg_val >= 0.15 else (4 if rg_val >= 0.08 else (3 if rg_val >= 0.0 else 2))
+    s13 = 4
+    s21 = 5 if roe_val >= 0.20 else (4 if roe_val >= 0.12 else (3 if roe_val >= 0.05 else 2))
+    s22 = s11
+    s23 = 5 if de_val < 50 else (4 if de_val < 150 else (3 if de_val < 300 else 2))
+    fcf_ratio = (fcf_val / net_inc) if net_inc and net_inc > 0 else 0.5
+    s24 = 5 if fcf_ratio >= 1.0 else (4 if fcf_ratio >= 0.75 else (3 if fcf_ratio >= 0.5 else 2))
+    s31 = 5 if fcf_yield_val >= 7.0 else (4 if fcf_yield_val >= 4.0 else (3 if fcf_yield_val >= 2.0 else 2))
+    s32 = 5 if (0 < peg_val <= 1.2) else (4 if (1.2 < peg_val <= 2.0) else (3 if peg_val > 0 else 2))
+    s33 = 4
+    s34 = 5 if insider_val >= 10.0 else (4 if insider_val >= 3.0 else (3 if insider_val >= 1.0 else 2))
+    s41, s42 = s21, s12
+    s43 = 5 if fcf_val > 0 else 3
+    s44 = 5 if "Buyers" in insider_action else (4 if "Stable" in insider_action else 3)
+    s45 = 5 if ("BUY" in analyst_rec or "OUTPERFORM" in analyst_rec) else (3 if "HOLD" in analyst_rec else 2)
+
+    # Risk Overlays
+    eps_rev_pct = eg_val if eg_val < -0.05 else 0.0
+    bookings_delta = eg_val - rg_val
+    val_cap_flag = 1 if (fwd_pe_val and fwd_pe_val >= 45.0 and peg_val and peg_val > 2.5) else 0
+    cyclical_ratio = round(op_margin / 0.15, 2) if sector in {"Energy", "Basic Materials", "Industrials"} else 1.0
+
+    rows = [
+        ("1.1", "Moat", "Competitive Advantage", 0.06, f"Gross Margin: {gm_val*100:.1f}%", s11, "Pricing power"),
+        ("1.2", "Moat", "Market Dynamics", 0.06, f"Rev Growth: {rg_val*100:.1f}%", s12, "TAM growth"),
+        ("1.3", "Moat", "Revenue Model Quality", 0.06, "Recurring / Sticky", s13, "Retention"),
+        ("2.1", "Quality", "ROE / Capital Returns", 0.07, f"ROE: {roe_val*100:.1f}%", s21, "Efficiency"),
+        ("2.2", "Quality", "Gross Margin Floor", 0.07, f"GM: {gm_val*100:.1f}%", s22, "Margin stability"),
+        ("2.3", "Quality", "Debt Leverage", 0.07, f"D/E: {de_val:.1f}%", s23, "Solvency"),
+        ("2.4", "Quality", "FCF Conversion", 0.07, f"FCF/NI: {fcf_ratio*100:.1f}%", s24, "Cash quality"),
+        ("3.1", "Valuation", "FCF Yield", 0.07, f"Yield: {fcf_yield_val:.1f}%", s31, "Cash yield"),
+        ("3.2", "Valuation", "PEG & P/E Multiple", 0.06, f"PEG: {peg_val:.2f}x | P/E: {pe_val:.1f}x", s32, "Growth multiple"),
+        ("3.3", "Governance", "Management Alignment", 0.06, "Shareholder returns", s33, "Capital policy"),
+        ("3.4", "Governance", "Insider Ownership", 0.05, f"Insiders: {insider_val:.1f}%", s34, "Skin in game"),
+        ("4.1", "Filters", "Multi-Yr Return Trend", 0.06, f"ROE: {roe_val*100:.1f}%", s41, "Durability"),
+        ("4.2", "Filters", "Top-Line Compounding", 0.06, f"Rev Growth: {rg_val*100:.1f}%", s42, "Expansion"),
+        ("4.3", "Filters", "Positive Free Cash Flow", 0.06, f"FCF: {curr_sym}{fcf_val:,.0f}", s43, "Self-funding"),
+        ("4.4", "Filters", "Insider Net Action", 0.06, insider_action, s44, "Recent activity"),
+        ("4.5", "Consensus", "Analyst Rating", 0.06, f"{analyst_rec} ({curr_sym}{fair_value:,.2f})", s45, f"{num_analysts} analysts"),
+    ]
+
+    base_score = sum(wt * sc for _, _, _, wt, _, sc, _ in rows)
+    penalties = (
+        (-0.50 if eps_rev_pct < -0.05 else 0.0)
+        + (-0.40 if bookings_delta < 0.0 else 0.0)
+        + (-0.60 if val_cap_flag >= 1 else 0.0)
+        + (-0.50 if cyclical_ratio > 1.50 else 0.0)
+    )
+    final_score = max(1.0, min(5.0, base_score + penalties))
+
+    if val_cap_flag >= 1:
+        verdict = "NEUTRAL / VAL CAP"
+    elif final_score >= 4.0:
+        verdict = "PASS / BUY"
+    elif final_score >= 3.2:
+        verdict = "WATCH / HOLD"
+    else:
+        verdict = "FAIL / AVOID"
+
+    target_buy = fair_value * 0.80
+
+    # Build Excel Workbook in memory
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Anti-Fragile Audit"
+    hdr_fill = PatternFill("solid", fgColor="1E293B")
+    hdr_font = Font(name="Calibri", bold=True, color="FFFFFF", size=11)
+    ws.merge_cells("A1:I1")
+    ws["A1"] = f"Anti-Fragile 16-Pillar Audit — {company_name} ({clean_ticker}) | {today_str}"
+    ws["A1"].font = Font(name="Calibri", bold=True, color="FFFFFF", size=13)
+    ws["A1"].fill = hdr_fill
+
+    headers = ["Ref", "Category", "Pillar / Criteria", "Weight", "Live Metric", "Score", "Weighted", "Status", "Notes"]
+    for c, h in enumerate(headers, 1):
+        cell = ws.cell(row=3, column=c, value=h)
+        cell.fill, cell.font = hdr_fill, hdr_font
+
+    for idx, (ref, cat, name, wt, met, sc, note) in enumerate(rows, 4):
+        ws.cell(row=idx, column=1, value=ref)
+        ws.cell(row=idx, column=2, value=cat)
+        ws.cell(row=idx, column=3, value=name)
+        ws.cell(row=idx, column=4, value=wt).number_format = "0.0%"
+        ws.cell(row=idx, column=5, value=met)
+        ws.cell(row=idx, column=6, value=sc)
+        ws.cell(row=idx, column=7, value=f"=D{idx}*F{idx}").number_format = "0.00"
+        ws.cell(row=idx, column=8, value=f'=IF(F{idx}>=4,"PASS",IF(F{idx}=3,"NEUTRAL","FAIL"))')
+        ws.cell(row=idx, column=9, value=note)
+
+    excel_buffer = io.BytesIO()
+    wb.save(excel_buffer)
+    excel_buffer.seek(0)
+
+    return {
+        "company_name": company_name,
+        "curr_sym": curr_sym,
+        "cmp": cmp,
+        "fair_value": fair_value,
+        "target_buy": target_buy,
+        "final_score": final_score,
+        "verdict": verdict,
+        "rows": rows,
+        "excel_bytes": excel_buffer,
+    }
+
+if st.button("Run 16-Pillar Audit", type="primary", use_container_width=True):
+    if ticker_input:
+        with st.spinner(f"Fetching fundamentals for {ticker_input}..."):
             try:
-                stock = yf.Ticker(ticker)
-                todays_data = stock.history(period="1d")
-                cmp = float(todays_data["Close"].iloc[-1]) if not todays_data.empty else float(stock.fast_info.last_price)
-                
-                info = stock.info or {}
-                company_name = info.get("longName") or info.get("shortName") or ticker
-                fair_value = float(info.get("targetMeanPrice")) if info.get("targetMeanPrice") else round(cmp * 1.25, 2)
-                analyst_rec = info.get("recommendationKey", "BUY").upper().replace("_", " ")
-                num_analysts = info.get("numberOfAnalystOpinions", 10)
-                
-                gm_val = info.get("grossMargins", 0.50)
-                roe_val = info.get("returnOnEquity", 0.20)
-                de_val = info.get("debtToEquity", 50.0)
-                rg_val = info.get("revenueGrowth", 0.10)
-                fcf_val = info.get("freeCashflow", 1000000000)
-                net_income_val = info.get("netIncomeToCommon", 1000000000)
-                pe_val = info.get("trailingPE", 20.0)
-                peg_val = info.get("pegRatio", 1.5)
-                insider_val = info.get("heldPercentInsiders", 0.03) * 100
-                
-                market_cap = info.get("marketCap", 0)
-                fcf_yield_val = (fcf_val / market_cap) * 100 if market_cap > 0 and fcf_val else 4.0
+                res = evaluate_stock(ticker_input)
+                st.subheader(f"{res['company_name']} ({ticker_input})")
 
-                # Scores
-                score_11 = 5 if gm_val >= 0.50 else (4 if gm_val >= 0.35 else 3)
-                score_12 = 5 if rg_val >= 0.15 else (4 if rg_val >= 0.08 else 3)
-                score_13 = 4
-                score_21 = 5 if roe_val >= 0.20 else (4 if roe_val >= 0.12 else 3)
-                score_22 = score_11
-                score_23 = 5 if de_val < 50 else (4 if de_val < 150 else 3)
-                fcf_net_ratio = (fcf_val / net_income_val) if net_income_val > 0 else 0.5
-                score_24 = 5 if fcf_net_ratio >= 1.0 else (4 if fcf_net_ratio >= 0.75 else 3)
-                score_31 = 5 if fcf_yield_val >= 7.0 else (4 if fcf_yield_val >= 4.0 else 3)
-                score_32 = 5 if (0 < peg_val <= 1.2) else (4 if (1.2 < peg_val <= 2.0) else 3)
-                score_33 = 4
-                score_34 = 5 if insider_val >= 10.0 else (4 if insider_val >= 3.0 else 3)
-                score_41 = score_21
-                score_42 = score_12
-                score_43 = 5 if fcf_val > 0 else 3
-                score_44 = 4
-                score_45 = 5 if "BUY" in analyst_rec else 3
+                col1, col2, col3 = st.columns(3)
+                col1.metric("Final Score", f"{res['final_score']:.2f} / 5.00")
+                col2.metric("CMP", f"{res['curr_sym']}{res['cmp']:,.2f}")
+                col3.metric("Max Buy (20% MoS)", f"{res['curr_sym']}{res['target_buy']:,.2f}")
 
-                pillars_data = [
-                    ("1.1", "Economic Moat", "Competitive Advantage", "Brand Moat & Pricing Power", 0.06, f"Gross Margin: {gm_val*100:.1f}%", score_11, "Strong moat characteristics"),
-                    ("1.2", "Economic Moat", "Market Dynamics", "TAM Expansion", 0.06, f"Revenue Growth: {rg_val*100:.1f}% YoY", score_12, "Market growth"),
-                    ("1.3", "Economic Moat", "Revenue Model Quality", "Recurring mix", 0.06, "Robust revenue quality", score_13, "Stable model"),
-                    ("2.1", "Financial Quality", "ROIC vs WACC Spread", "ROIC exceeds WACC", 0.07, f"ROE / Capital Returns: {roe_val*100:.1f}%", score_21, "Capital efficiency"),
-                    ("2.2", "Financial Quality", "Gross Margin Floor", "Gross Margin > 40%", 0.07, f"Gross Margin: {gm_val*100:.1f}%", score_22, "Reliable margins"),
-                    ("2.3", "Financial Quality", "Debt Leverage", "Net Debt / EBITDA <= 2.0x", 0.07, f"Debt/Equity: {de_val:.1f}%", score_23, "Balance sheet leverage"),
-                    ("2.4", "Financial Quality", "Accrual & FCF Conversion", "FCF / Net Income >= 75%", 0.07, f"FCF/NetInc Ratio: {fcf_net_ratio*100:.1f}%", score_24, "Cash conversion audit"),
-                    ("3.1", "Valuation", "FCF Yield / Valuation", "FCF Yield > 5.0%", 0.07, f"FCF Yield: {fcf_yield_val:.1f}% (CMP: ${cmp:,.2f})", score_31, "Valuation check"),
-                    ("3.2", "Valuation", "PEG Ratio", "PEG 1.0 - 1.5", 0.06, f"PEG Ratio: {peg_val:.2f}x | P/E: {pe_val:.1f}x", score_32, "Growth multiple check"),
-                    ("3.3", "Governance", "Management Alignment", "High executive stake", 0.06, "Active shareholder returns & buybacks", score_33, "Shareholder-friendly execution"),
-                    ("3.4", "Governance", "Insider Ownership %", "Significant skin-in-the-game", 0.05, f"Insider Holding: {insider_val:.1f}%", score_34, "Executive ownership depth"),
-                    ("4.1", "Screening Filters", "5-Year ROIC Trend", "ROIC > 15% 5-yr avg", 0.06, "Consistent multi-year compounding", score_41, "Cycle resilience"),
-                    ("4.2", "Screening Filters", "Top-Line Growth", "Revenue Growth > 8%", 0.06, f"Revenue Growth: {rg_val*100:.1f}% YoY", score_42, "Top-line expansion"),
-                    ("4.3", "Screening Filters", "Maintenance CapEx Efficiency", "Positive FCF", 0.06, f"Free Cash Flow: ${fcf_val:,.0f}", score_43, "Asset efficiency"),
-                    ("4.4", "Screening Filters", "Insider Net Action", "Net open-market buying", 0.06, "Stable insider positioning", score_44, "Insider trading momentum"),
-                    ("4.5", "Expert Opinion", "Wall Street Analyst Consensus", "Strong Buy / Buy", 0.06, f"Consensus: {analyst_rec} (${fair_value:,.2f} Target)", score_45, "Wall Street backing")
-                ]
-
-                # Calculate overall metrics for browser UI
-                total_weighted_score = sum(row[4] * row[6] for row in pillars_data)
-                margin_of_safety = 0.20
-                target_buy_price = fair_value * (1 - margin_of_safety)
-                is_in_buy_zone = cmp <= target_buy_price
-                upside_pct = ((fair_value - cmp) / cmp) * 100
-
-                # --- BROWSER UI DISPLAY ---
-                st.divider()
-                st.markdown(f"### 📊 {company_name} ({ticker})")
-                st.caption(f"Wall Street Consensus: **{analyst_rec}** ({num_analysts} Analysts)")
-
-                # Key Metrics Grid
-                col1, col2, col3, col4 = st.columns(2)
-                col1.metric("Current Price", f"${cmp:,.2f}")
-                col2.metric("Fair Value Target", f"${fair_value:,.2f}", f"{upside_pct:+.1f}% Upside")
-                col3.metric("Max Buy Price (20% MoS)", f"${target_buy_price:,.2f}")
-                col4.metric("16-Pillar Score", f"{total_weighted_score:.2f} / 5.00")
-
-                # Buy Zone Status Banner
-                if is_in_buy_zone:
-                    st.success(f"🟢 **IN BUY ZONE** — Trading below your ${target_buy_price:,.2f} margin-of-safety threshold.")
+                if "BUY" in res["verdict"]:
+                    st.success(f"**Verdict:** {res['verdict']}")
+                elif "AVOID" in res["verdict"]:
+                    st.error(f"**Verdict:** {res['verdict']}")
                 else:
-                    st.warning(f"🟡 **WAIT FOR DIP** — Trading ${cmp - target_buy_price:,.2f} above your ${target_buy_price:,.2f} target buy price.")
-
-                # Build DataFrame for Interactive Browser Table
-                df_rows = []
-                for r in pillars_data:
-                    status_label = "🟢 PASS" if r[6] >= 4 else ("🟡 NEUTRAL" if r[6] == 3 else "🔴 FAIL")
-                    df_rows.append({
-                        "Ref": r[0],
-                        "Category": r[1],
-                        "Metric": r[2],
-                        "Company Value": r[5],
-                        "Score": f"{r[6]}/5",
-                        "Weight": f"{r[4]*100:.0f}%",
-                        "Weighted": round(r[4] * r[6], 2),
-                        "Status": status_label,
-                        "Notes": r[7]
-                    })
-                
-                df_display = pd.DataFrame(df_rows)
-                st.markdown("#### 📋 16-Pillar Audit Breakdown")
-                st.dataframe(df_display, use_container_width=True, hide_index=True)
-
-                # --- EXCEL WORKBOOK GENERATION ---
-                wb = openpyxl.Workbook()
-                ws1 = wb.active
-                ws1.title = "Established Companies"
-                ws1.views.sheetView[0].showGridLines = True
-
-                TITLE_FONT = Font(name="Calibri", size=16, bold=True, color="0F172A")
-                SUB_FONT = Font(name="Calibri", size=12, italic=True, color="64748B")
-                HEADER_FILL = PatternFill(start_color="1E293B", end_color="1E293B", fill_type="solid")
-                HEADER_FONT = Font(name="Calibri", size=13, bold=True, color="FFFFFF")
-                ROW_FONT = Font(name="Calibri", size=12)
-                BOLD_FONT = Font(name="Calibri", size=12, bold=True, color="0F172A")
-                GREEN_FONT = Font(name="Calibri", size=12, bold=True, color="166534")
-                AMBER_FONT = Font(name="Calibri", size=12, bold=True, color="B45309")
-                RED_FONT = Font(name="Calibri", size=12, bold=True, color="991B1B")
-
-                ALIGN_LEFT = Alignment(horizontal="left", vertical="center", wrap_text=True)
-                ALIGN_CENTER = Alignment(horizontal="center", vertical="center", wrap_text=True)
-                BORDER_THIN = Border(left=Side(style="thin", color="CBD5E1"), right=Side(style="thin", color="CBD5E1"), top=Side(style="thin", color="CBD5E1"), bottom=Side(style="thin", color="CBD5E1"))
-
-                ws1["A1"] = f"Anti-Fragile Stock Evaluation Framework ({company_name})"
-                ws1["A1"].font = TITLE_FONT
-                ws1["A3"] = f"Company / Ticker: {company_name} ({ticker})"
-                ws1["A3"].font = BOLD_FONT
-                ws1["A4"] = f"Evaluation Date: 2026-11-13 | Consensus: {analyst_rec} ({num_analysts} Analysts)"
-                ws1["A4"].font = SUB_FONT
-
-                headers = ["Ref #", "Category", "Evaluation Metric / Criteria", "Target Threshold", "Weight", "Company Value / Metric", "Score (1-5)", "Weighted Score", "Pass / Fail / Neutral", "Notes / Remarks"]
-                ws1.row_dimensions[6].height = 32
-                for col_idx, h in enumerate(headers, 1):
-                    c = ws1.cell(row=6, column=col_idx, value=h)
-                    c.fill = HEADER_FILL
-                    c.font = HEADER_FONT
-                    c.alignment = ALIGN_CENTER
-                    c.border = BORDER_THIN
-
-                for idx, row in enumerate(pillars_data, 7):
-                    ws1.row_dimensions[idx].height = 28
-                    ws1.cell(row=idx, column=1, value=row[0]).alignment = ALIGN_CENTER
-                    ws1.cell(row=idx, column=2, value=row[1]).alignment = ALIGN_LEFT
-                    ws1.cell(row=idx, column=3, value=row[2]).alignment = ALIGN_LEFT
-                    ws1.cell(row=idx, column=4, value=row[3]).alignment = ALIGN_LEFT
-                    
-                    c_weight = ws1.cell(row=idx, column=5, value=row[4])
-                    c_weight.number_format = "0.0%"
-                    c_weight.alignment = ALIGN_CENTER
-                    
-                    ws1.cell(row=idx, column=6, value=row[5]).alignment = ALIGN_LEFT
-                    
-                    c_score = ws1.cell(row=idx, column=7, value=row[6])
-                    c_score.alignment = ALIGN_CENTER
-                    c_score.font = BOLD_FONT
-                    
-                    c_weighted = ws1.cell(row=idx, column=8, value=f"=G{idx}*E{idx}")
-                    c_weighted.number_format = "0.00"
-                    c_weighted.alignment = ALIGN_CENTER
-                    
-                    c_pass = ws1.cell(row=idx, column=9, value=f'=IF(G{idx}>=4, "PASS", IF(G{idx}=3, "NEUTRAL", "FAIL"))')
-                    c_pass.alignment = ALIGN_CENTER
-                    c_pass.font = BOLD_FONT
-                    
-                    c_notes = ws1.cell(row=idx, column=10, value=row[7])
-                    c_notes.alignment = ALIGN_LEFT
-
-                    for col in range(1, 11):
-                        if col != 7 and col != 9:
-                            ws1.cell(row=idx, column=col).font = ROW_FONT
-                        ws1.cell(row=idx, column=col).border = BORDER_THIN
-
-                ws1.conditional_formatting.add("I7:I22", CellIsRule(operator="equal", formula=["\"PASS\""], stopIfTrue=True, font=GREEN_FONT))
-                ws1.conditional_formatting.add("I7:I22", CellIsRule(operator="equal", formula=["\"NEUTRAL\""], stopIfTrue=True, font=AMBER_FONT))
-                ws1.conditional_formatting.add("I7:I22", CellIsRule(operator="equal", formula=["\"FAIL\""], stopIfTrue=True, font=RED_FONT))
-
-                ws1.row_dimensions[24].height = 30
-                ws1.cell(row=24, column=3, value="OVERALL SCORE & WEIGHTED TOTAL").font = BOLD_FONT
-                ws1.cell(row=24, column=3).alignment = Alignment(horizontal="right", vertical="center")
-                c_tot = ws1.cell(row=24, column=8, value="=SUM(H7:H22)")
-                c_tot.font = BOLD_FONT
-                c_tot.number_format = "0.00"
-                c_tot.alignment = ALIGN_CENTER
-
-                # Valuation Calculator
-                ws1.cell(row=26, column=2, value="VALUATION & TARGET BUY PRICE CALCULATOR").font = BOLD_FONT
-                val_headers = ["Valuation Method", "Current Market Price", "Fair Value Estimate", "Margin of Safety Required", "Target Max Buy Price", "Status vs Current Price"]
-                ws1.row_dimensions[27].height = 28
-                for col_idx, vh in enumerate(val_headers, 2):
-                    c = ws1.cell(row=27, column=col_idx, value=vh)
-                    c.fill = HEADER_FILL
-                    c.font = HEADER_FONT
-                    c.alignment = ALIGN_CENTER
-                    c.border = BORDER_THIN
-
-                ws1.row_dimensions[28].height = 26
-                ws1.cell(row=28, column=2, value="Discounted Fair Value Model").alignment = ALIGN_LEFT
-                ws1.cell(row=28, column=3, value=cmp).number_format = "$#,##0.00"
-                ws1.cell(row=28, column=4, value=fair_value).number_format = "$#,##0.00"
-                ws1.cell(row=28, column=5, value=0.20).number_format = "0.0%"
-                target_cell = ws1.cell(row=28, column=6, value="=D28*(1-E28)")
-                target_cell.number_format = "$#,##0.00"
-                target_cell.font = BOLD_FONT
-                status_cell = ws1.cell(row=28, column=7, value='=IF(C28<=F28, "IN BUY ZONE", "WAIT FOR DIP")')
-                status_cell.font = BOLD_FONT
-
-                for col in range(2, 8):
-                    ws1.cell(row=28, column=col).border = BORDER_THIN
-
-                output = io.BytesIO()
-                wb.save(output)
-                output.seek(0)
+                    st.warning(f"**Verdict:** {res['verdict']}")
 
                 st.download_button(
-                    label="📥 Download Full Excel Scorecard (.xlsx)",
-                    data=output,
-                    file_name=f"{ticker}_Evaluated_Scorecard.xlsx",
+                    label="📥 Download Formatted Excel (.xlsx)",
+                    data=res["excel_bytes"],
+                    file_name=f"{ticker_input}_AntiFragile_Audit.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    use_container_width=True
+                    use_container_width=True,
+                )
+
+                st.dataframe(
+                    [{"Ref": r[0], "Pillar": r[2], "Metric": r[4], "Score": r[5]} for r in res["rows"]],
+                    use_container_width=True,
+                    hide_index=True,
                 )
             except Exception as e:
-                st.error(f"Error fetching data for {ticker}: {e}")
-
-elif app_mode == "Pre-Profit Startup Evaluator":
-    st.subheader("🚀 Pre-Profit Startup Unit Economics Evaluator")
-    startup_name = st.text_input("Startup Name:", value="SaaSCo")
-    arr_growth = st.slider("YoY ARR Growth Rate (%)", 10, 200, 85) / 100.0
-    burn_multiple = st.slider("Burn Multiple (Net Burn / New ARR)", 0.5, 3.0, 1.2, 0.1)
-    runway_months = st.slider("Cash Runway (Months)", 3, 36, 22)
-    ltv_cac = st.slider("LTV / CAC Ratio", 1.0, 8.0, 4.2, 0.1)
-
-    if st.button("Generate Startup Audit"):
-        st.divider()
-        st.markdown(f"### 🚀 {startup_name} — Unit Economics Audit")
-        
-        c1, c2 = st.columns(2)
-        c1.metric("ARR Growth", f"{arr_growth*100:.0f}%", "Top Quartile" if arr_growth >= 0.80 else "Moderate")
-        c2.metric("Burn Multiple", f"{burn_multiple:.1f}x", "Healthy" if burn_multiple <= 1.5 else "High Burn", delta_color="inverse")
-        
-        c3, c4 = st.columns(2)
-        c3.metric("Cash Runway", f"{runway_months} Months", "Safe" if runway_months >= 18 else "Raise Soon")
-        c4.metric("LTV / CAC", f"{ltv_cac:.1f}x", "Strong" if ltv_cac >= 3.0 else "Weak")
-
-        startup_df = pd.DataFrame([
-            {"Metric": "YoY ARR Growth", "Actual": f"{arr_growth*100:.0f}%", "Target": ">= 80%", "Status": "🟢 PASS" if arr_growth >= 0.80 else "🟡 NEUTRAL"},
-            {"Metric": "Burn Multiple", "Actual": f"{burn_multiple:.1f}x", "Target": "<= 1.5x", "Status": "🟢 PASS" if burn_multiple <= 1.5 else "🔴 FAIL"},
-            {"Metric": "Cash Runway", "Actual": f"{runway_months} mos", "Target": ">= 18 mos", "Status": "🟢 PASS" if runway_months >= 18 else "🟡 NEUTRAL"},
-            {"Metric": "LTV / CAC Ratio", "Actual": f"{ltv_cac:.1f}x", "Target": ">= 3.0x", "Status": "🟢 PASS" if ltv_cac >= 3.0 else "🔴 FAIL"}
-        ])
-        st.dataframe(startup_df, use_container_width=True, hide_index=True)
+                st.error(f"Error: {e}")
