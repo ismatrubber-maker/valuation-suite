@@ -1,4 +1,4 @@
-cat << 'EOF' > ~/Documents/app.py
+
 import streamlit as st
 import yfinance as yf
 import io
