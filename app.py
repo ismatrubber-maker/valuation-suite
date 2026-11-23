@@ -30,6 +30,32 @@ Version 2.2 adds two more sections inside that tab, with the same rules (off by 
                      acquisitions, equity sales, officer changes and so on). It needs a contact email, which
                      the SEC asks every automated request to carry; nothing is fetched without one.
 
+Version 2.3 lets you type a company name as well as a ticker symbol:
+  * Company search - Yahoo Finance's own search turns the text into listed companies (US and India). A
+                     ticker that is clear runs exactly as before. A name that could mean several companies
+                     shows a pick-one list first, so the wrong company is never analysed silently. If the
+                     search cannot be reached, the typed text is used as a ticker, as in version 2.2.
+                     Finding a company never changes a score, a label or a gate.
+
+Version 2.4 is a layout change for phones. The scoring is untouched:
+  * Controls on the page - the mode switch, the search box and the Run button sit at the top of the page (no
+                     sidebar drawer to open), and the Go key on the phone keyboard runs the search. The many
+                     optional settings are in one folded Settings panel.
+  * Verdict first  - each result opens on a card with the company, the rating, and a gauge of the score against
+                     the Weak, Mixed and Strong bands. The 15 pillars are compact rows you can tap for detail.
+  * Phone-sized    - two-up number tiles, charts that do not trap your finger while you scroll, larger tap
+                     targets and no dependence on hovering.
+
+Version 2.4.1 keeps the app working when Yahoo's quote service refuses a shared cloud server. The scoring is untouched:
+  * Reduced-data mode - if Yahoo's quote service answers a valid symbol with almost nothing (a known pattern on
+                     shared hosts), the price comes from the daily price history, the name and sector from Yahoo's
+                     search service, and the valuation inputs from the annual statements. The result says so on
+                     screen. Nothing is rebuilt that cannot be sourced, and the next run asks the quote service again.
+  * Honest errors  - a refused quote is no longer reported as a wrong symbol, and the Technical details box says
+                     what Yahoo did answer.
+  * Layout         - the mode buttons fill the width (Pre-profit was cut off), and the page ends with some space so
+                     that the Streamlit badge does not cover the last line.
+
 Design rules
   * Nothing is invented. A metric that cannot be sourced shows "n/a", is left out of the score and
     the remaining weights are rescaled. Data coverage is shown next to every score.
@@ -41,6 +67,7 @@ Design rules
 from __future__ import annotations
 
 import html as html_lib
+import inspect
 import json
 import math
 import re
@@ -56,9 +83,12 @@ import streamlit as st
 import yfinance as yf
 
 st.set_page_config(
-    page_title="Anti-Fragile Stock & Startup Screener",
+    page_title="Stock Screener",
     page_icon="🛡️",
-    layout="wide",
+    layout="centered",
+    initial_sidebar_state="collapsed",
+    menu_items={"Get help": None, "Report a bug": None,
+                "About": "Anti-Fragile Stock & Startup Screener. A screening tool for research and education, not investment advice."},
 )
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -78,8 +108,17 @@ PROJECTION_GROWTH_CAP = 1.5    # starting growth used in the venture projection 
 DEFAULT_FADE = 0.80
 DEFAULT_COST_RATIO = 0.60
 
+# Reduced-data mode (version 2.4.1): used only when Yahoo's quote service does not answer a symbol.
+QUOTE_MIN_FIELDS = 8           # a real equity has 100+ quote fields; fewer than this means Yahoo answered badly
+REBUILD_PERIOD = "1y"          # price history asked for when the quote service is refused
+REBUILD_STALE_DAYS = 10        # a last close older than this means the symbol is not trading (delisted or suspended)
+REBUILD_PS_MIN = 0.05          # market cap / revenue outside this band means the price and the statements are
+REBUILD_PS_MAX = 200.0         # probably in different currencies (an ADR, for example), so price-based figures are left out
+YAHOO_SECTORS = ("Technology", "Financial Services", "Healthcare", "Consumer Cyclical", "Consumer Defensive", "Industrials",
+                 "Basic Materials", "Energy", "Utilities", "Real Estate", "Communication Services")     # Yahoo's eleven names
+
 # Macro overlay (version 2). All of it is optional and off by default.
-APP_VERSION = "2.2 (macro, context, capital-allocation and filings options)"
+APP_VERSION = "2.4.1 (phone layout, macro, context, capital-allocation, filings and company-search options)"
 MACRO_TTL = 3 * 60 * 60        # seconds fetched macro data stays cached
 HTTP_TIMEOUT = 10              # seconds to wait for FRED before giving up on it
 REQ_RETURN_MIN = 0.08          # a rate-linked required return is held inside this band
@@ -130,7 +169,7 @@ LENDER_TEXT = (
     "Banks, insurers, NBFCs and other lenders run on deposits and leverage, so gross margin, debt/equity "
     "and free cash flow do not mean what this rubric assumes. Use a bank-specific lens (net interest "
     "margin, gross/net NPA, capital adequacy, ROA, price/book). Yahoo files payment networks such as Visa "
-    "and Mastercard under the same industry even though they do not lend: tick the sidebar checkbox to "
+    "and Mastercard under the same industry even though they do not lend: tick the Run anyway box under Settings (Screen tab) to "
     "run them anyway."
 )
 FIN_CAUTION_TEXT = (
@@ -178,6 +217,35 @@ DISCLAIMER = (
 # ══════════════════════════════════════════════════════════════════════════════
 class DataError(Exception):
     """A usable data snapshot could not be built (bad ticker, empty response, ...)."""
+
+
+class QuoteRefused(DataError):
+    """Yahoo's quote service did not answer usefully for a symbol: it raised, or it sent back almost nothing. The
+    statements, the price history and Yahoo's search may still answer, so a snapshot can be rebuilt from them. `why` is
+    one plain line for the Technical details box, and `rate_limited` says whether Yahoo named rate limiting."""
+
+    def __init__(self, message, why="", rate_limited=False):
+        super().__init__(message)
+        self.why = why
+        self.rate_limited = rate_limited
+
+
+class PartsIncomplete(DataError):
+    """Raised by fetch_rebuild_parts when any piece was refused or missing, so that what did arrive is used now but is
+    never cached. `parts` holds it."""
+
+    def __init__(self, parts):
+        super().__init__("some of the data used to rebuild a snapshot did not arrive")
+        self.parts = parts
+
+
+class YahooUnavailable(DataError):
+    """Yahoo gave nothing usable for a symbol. The message is safe to show; `details` are short lines for the
+    Technical details box."""
+
+    def __init__(self, message, details=()):
+        super().__init__(message)
+        self.details = list(details)
 
 
 def num(x):
@@ -375,37 +443,180 @@ def share_trend(points):
     return rate, ""
 
 
-@st.cache_data(ttl=CACHE_TTL, max_entries=64, show_spinner=False)
-def fetch_snapshot(ticker: str) -> dict:
-    """Pull info and the three annual statements from Yahoo. Raises (and so is not cached) on failure."""
-    tk = yf.Ticker(ticker)
-    info = tk.info
-    if not isinstance(info, dict) or not info:
-        raise DataError(f"Yahoo returned no data for '{ticker}'. Check the symbol and try again.")
-    price = first_num(info, "currentPrice", "regularMarketPrice", "previousClose")
-    if price is None and not (info.get("longName") or info.get("shortName")):
-        raise DataError(
-            f"No market data found for '{ticker}'. Check the symbol: Indian stocks need .NS (NSE) or .BO (BSE), "
-            "for example RELIANCE.NS."
-        )
-    if len(info) < 8:  # a real equity has 100+ fields; a handful means Yahoo answered badly (often rate limiting)
-        raise DataError(
-            f"Yahoo returned only partial data for '{ticker}' ({len(info)} fields), which often happens when it is "
-            "rate-limiting a shared server. Wait a minute and click Run audit again."
-        )
-    frames = {}
-    for key, attr in (("income", "financials"), ("balance", "balance_sheet"), ("cashflow", "cashflow")):
+STATEMENT_ATTRS = (("income", "financials"), ("balance", "balance_sheet"), ("cashflow", "cashflow"))
+
+
+def quote_answered(info):
+    """True when Yahoo's quote service really answered: more than a handful of fields, and a price or a name among them.
+    A refused request often comes back as a dict that holds a single empty field, which is just as truthy as a real one."""
+    return (isinstance(info, dict) and len(info) >= QUOTE_MIN_FIELDS
+            and (first_num(info, "currentPrice", "regularMarketPrice", "previousClose") is not None
+                 or bool(info.get("longName") or info.get("shortName"))))
+
+
+def statement_frames(tk):
+    """The three annual statements of a yfinance Ticker -> ({"income", "balance", "cashflow"} frames, error lines).
+    A statement Yahoo does not have, or refuses, is an empty frame, so it only lowers data coverage."""
+    frames, errors = {}, []
+    for key, attr in STATEMENT_ATTRS:
         try:
             df = getattr(tk, attr)
-        except Exception:  # statements are optional; missing ones just reduce data coverage
+        except Exception as exc:  # noqa: BLE001 - statements are optional
             df = None
+            errors.append(f"{attr}: {type(exc).__name__}")
         frames[key] = df if isinstance(df, pd.DataFrame) else pd.DataFrame()
+    return frames, errors
+
+
+@st.cache_data(ttl=CACHE_TTL, max_entries=64, show_spinner=False)
+def fetch_quote_snapshot(ticker: str) -> dict:
+    """Info and the three annual statements from Yahoo. Raises QuoteRefused (so nothing is cached) when Yahoo's quote
+    service raises or answers with almost nothing."""
+    tk = yf.Ticker(ticker)
+    try:
+        info = tk.info
+    except Exception as exc:  # noqa: BLE001 - yfinance raises when Yahoo rate-limits
+        why = f"{type(exc).__name__}: {_text(str(exc), 100)}"
+        limited = re.search(r"RateLimit|Too Many Requests|\b429\b", why) is not None
+        raise QuoteRefused(f"Yahoo's quote service raised an error for '{ticker}' ({why}).", why, limited) from None
+    if not quote_answered(info):
+        n = len(info) if isinstance(info, dict) else 0
+        why = f"the quote service sent back {n} field{'' if n == 1 else 's'} and no usable price or name"
+        raise QuoteRefused(f"Yahoo's quote service did not answer usefully for '{ticker}' ({why}).", why)
+    frames, _ = statement_frames(tk)
     return {
         "ticker": ticker,
         "info": dict(info),
         "fetched_at": datetime.now(timezone.utc).strftime("%d %b %Y %H:%M UTC"),
         **frames,
     }
+
+
+@st.cache_data(ttl=CACHE_TTL, max_entries=32, show_spinner=False)
+def fetch_rebuild_parts(ticker: str) -> dict:
+    """What can be had without Yahoo's quote service: the three annual statements, a year of daily closes, and the
+    symbol's name and sector from Yahoo's search service. Raises PartsIncomplete (which carries what did arrive, and so
+    caches nothing) when any piece was refused or missing."""
+    tk = yf.Ticker(ticker)
+    frames, errors = statement_frames(tk)
+    try:
+        closes = _yahoo_closes(ticker, REBUILD_PERIOD)
+    except Exception as exc:  # noqa: BLE001 - any failure leaves the price out
+        closes = []
+        errors.append(f"price history: {type(exc).__name__}")
+    try:
+        meta = fetch_quote_meta(ticker)
+    except Exception as exc:  # noqa: BLE001 - any failure leaves the sector out
+        meta = {}
+        errors.append(f"search: {type(exc).__name__}")
+    parts = {"frames": frames, "closes": closes, "meta": meta, "errors": errors,
+             "fetched_at": datetime.now(timezone.utc).strftime("%d %b %Y %H:%M UTC")}
+    if errors:
+        raise PartsIncomplete(parts)
+    return parts
+
+
+def rebuild_info(ticker, frames, closes, meta):
+    """Stand-in for the quote fields the screen reads, built from the statements, the price history and the search
+    answer -> (info dict, notes). Only fields that can be sourced are produced. Every other field stays missing, so its
+    pillar drops out and the remaining weights are rescaled, as for any company Yahoo lacks a figure for."""
+    info, notes = {}, []
+    for field, key in (("longName", "name"), ("sector", "sector"), ("industry", "industry")):
+        if meta.get(key):
+            info[field] = meta[key]
+    if info.get("sector"):
+        notes.append("Company name, sector and industry come from Yahoo's search service.")
+    else:
+        notes.append("Yahoo's search service gave no sector for this symbol.")
+    price = closes[-1][1] if closes else None
+    if price:
+        info["currentPrice"] = price
+        notes.append(f"The price is the last daily close ({closes[-1][0]}).")
+    inc, bal = frames["income"], frames["balance"]
+    ebitda = latest(inc, "EBITDA", "Normalized EBITDA")
+    if ebitda is not None:
+        info["ebitda"] = ebitda
+    debt = latest(bal, "Total Debt")                       # the venture lens reads these two from the quote fields only
+    if debt is not None:
+        info["totalDebt"] = debt
+    cash = latest(bal, "Cash Cash Equivalents And Short Term Investments", "Cash And Cash Equivalents")
+    if cash is not None:
+        info["totalCash"] = cash
+    shares_pts = stmt_series(bal, "Ordinary Shares Number", "Share Issued")
+    rev_pts = stmt_series(inc, "Total Revenue", "Operating Revenue")
+    shares = shares_pts[-1][1] if shares_pts else None
+    revenue = rev_pts[-1][1] if rev_pts else None
+    cap = price * shares if (price and shares and shares > 0) else None
+    if listing_scope(ticker) == "other":
+        notes.append("Market cap, P/E, P/B and FCF yield are left out: for a listing outside the US and India the "
+                     "price and the statements may be in different currencies.")
+    elif cap is None or not revenue or revenue <= 0:
+        notes.append("Market cap, P/E, P/B and FCF yield are left out: the share count or the revenue was missing.")
+    elif not REBUILD_PS_MIN <= cap / revenue <= REBUILD_PS_MAX:
+        notes.append("Market cap, P/E, P/B and FCF yield are left out: market cap against revenue looks implausible, "
+                     "which usually means the price and the statements are in different currencies (an ADR, for example).")
+    else:
+        info["marketCap"] = cap
+        notes.append("Market cap is the last close times the share count on the latest annual balance sheet.")
+        eps_pts = stmt_series(inc, "Diluted EPS", "Basic EPS")
+        if eps_pts:
+            info["trailingEps"] = eps_pts[-1][1]
+            notes.append("P/E and PEG use the latest annual earnings per share, not trailing twelve months.")
+        equity_pts = stmt_series(bal, "Stockholders Equity", "Common Stock Equity")
+        if equity_pts and equity_pts[-1][1] > 0:
+            info["priceToBook"] = cap / equity_pts[-1][1]
+    notes.append("Analyst consensus and insider ownership are not available in this mode, so those pillars are left out.")
+    return info, notes
+
+
+def lib_version(module):
+    """The version text of an imported library, or 'unknown'."""
+    return _text(getattr(module, "__version__", ""), 20) or "unknown"
+
+
+def yahoo_unavailable(ticker, refused, errors):
+    """The error for a symbol that nothing could be rebuilt for. Names the likely cause without claiming to know it."""
+    details = [f"Quote service: {refused.why or str(refused)}"] + list(errors)
+    details.append(f"yfinance {lib_version(yf)}, Streamlit {lib_version(st)}")
+    if refused.rate_limited or any("RateLimit" in line for line in errors):
+        message = ("Yahoo Finance is rate-limiting this server, which is common on shared cloud hosts. "
+                   "Wait a few minutes and tap Run audit again.")
+    else:
+        message = (f"Yahoo Finance returned nothing usable for '{ticker}'. Check the symbol: Indian stocks need .NS (NSE) "
+                   "or .BO (BSE), for example RELIANCE.NS. If the symbol is right, Yahoo is probably refusing requests "
+                   "from the shared server this app runs on, so wait a few minutes and tap Run audit again.")
+    return YahooUnavailable(message, details)
+
+
+def rebuild_snapshot(ticker, refused):
+    """The snapshot of a symbol whose quote Yahoo's quote service refused, rebuilt from what else Yahoo answers. It carries
+    a "reduced" note that the screen shows. It needs a recent price, so a delisted symbol is not rated on old figures."""
+    try:
+        parts = fetch_rebuild_parts(ticker)
+    except PartsIncomplete as partial:
+        parts = partial.parts
+    frames, meta, errors = parts["frames"], parts["meta"], parts["errors"]
+    closes = [(day, px) for day, px in parts["closes"] if px > 0]       # a zero or negative bar is not a price
+    if not closes:
+        raise yahoo_unavailable(ticker, refused, errors)
+    age = _days_between(closes[-1][0], datetime.now(timezone.utc).strftime("%Y-%m-%d"))
+    if age > REBUILD_STALE_DAYS:
+        raise YahooUnavailable(
+            f"The latest price Yahoo has for '{ticker}' is from {closes[-1][0]}, so the symbol looks delisted or "
+            "suspended. No result is issued.", [f"Quote service: {refused.why or str(refused)}"] + list(errors))
+    info, notes = rebuild_info(ticker, frames, closes, meta)
+    return {"ticker": ticker, "info": info, "fetched_at": parts["fetched_at"], **frames,
+            "reduced": {"why": refused.why or str(refused), "notes": notes, "errors": list(errors)}}
+
+
+def fetch_snapshot(ticker: str) -> dict:
+    """The data snapshot for one symbol. Yahoo's quote service normally answers, and the result is cached for an hour.
+    When it does not, the snapshot is rebuilt from the statements, the price history and the search service, and carries
+    a "reduced" note. A rebuilt snapshot is not cached as a whole, so the next run asks the quote service again."""
+    try:
+        return fetch_quote_snapshot(ticker)
+    except QuoteRefused as refused:
+        return rebuild_snapshot(ticker, refused)
 
 
 def extract_public_metrics(snap):
@@ -428,6 +639,7 @@ def extract_public_metrics(snap):
         "market_cap": pos(first_num(info, "marketCap")),
         "pb": first_num(info, "priceToBook"),
         "roe_latest": first_num(info, "returnOnEquity"),
+        "reduced": snap.get("reduced"),         # None normally; a dict when the quote service was refused (version 2.4.1)
     }
 
     # Income statement ---------------------------------------------------------
@@ -816,7 +1028,7 @@ CTX_CHECKLIST = (
     "that price.",
     "**What does the company's own filing or exchange announcement say**, compared with the headline?",
     "**Does it change revenue, margins or cash flow** within about two years, or only sentiment?",
-    "**How much has the price already moved** since the news? Put the date in the sidebar to see the move for the "
+    "**How much has the price already moved** since the news? Put the date under Settings (Context tab) to see the move for the "
     "stock, its sector and the market.",
     "**What could go wrong that the news does not cover:** dilution, a guidance cut, a lost customer, a policy reversal?",
     "**Do the pillar scores on the first tab support the story**, or does the story ask you to look past weak numbers?",
@@ -946,7 +1158,7 @@ def sector_proxy(m, market, override=""):
             return symbol, f"{label} ({symbol})", note
     return None, "", (f"No sector fund or index is mapped to '{sector or 'unknown'}'"
                       + (f" ({m.get('industry')})" if m.get("industry") else "")
-                      + ". Type a symbol in the sidebar to compare against one.")
+                      + ". Type a symbol under Settings (Context tab) to compare against one.")
 
 
 def _news_date(value):
@@ -1415,7 +1627,7 @@ def valid_contact(text):
 
 
 def sec_contact(cfg):
-    """The contact email typed in the sidebar, else SEC_CONTACT from the app's secrets, else ''."""
+    """The contact email typed under Settings, else SEC_CONTACT from the app's secrets, else ''."""
     typed = str(cfg.get("sec_contact") or "").strip()
     if typed:
         return typed
@@ -1935,7 +2147,7 @@ def us_10y(mc, get_mkt=None, get_fred=None):
 def resolve_rates(m, cfg, get_mkt=None, get_fred=None):
     """Which required return and exit-multiple floor the forward model should use for this stock.
 
-    With both links off (the default) this returns the sidebar's fixed values and fetches nothing. A link that
+    With both links off (the default) this returns the fixed values from Settings and fetches nothing. A link that
     cannot be applied (unsupported currency, no yield available) falls back to the fixed values and says why.
     """
     out = default_rates(cfg)
@@ -1955,10 +2167,10 @@ def resolve_rates(m, cfg, get_mkt=None, get_fred=None):
         y10, source = mc.get("in_y10"), "entered by you"
     if y10 is None:
         if market == "US":
-            out["notes"].append(f"No US 10-year yield could be loaded ({source}). Type one in under Macro overlay in the "
-                                "sidebar; until then the fixed assumptions are used.")
+            out["notes"].append(f"No US 10-year yield could be loaded ({source}). Type one in under Settings (Macro tab); "
+                                "until then the fixed assumptions are used.")
         else:
-            out["notes"].append("No India 10-year yield has been entered under Macro overlay in the sidebar, so the "
+            out["notes"].append("No India 10-year yield has been entered under Settings (Macro tab), so the "
                                 "fixed assumptions are used.")
         return out
     erp = mc.get("erp", DEFAULT_ERP)
@@ -2144,7 +2356,7 @@ def stress_tests(m, si, shock, reg_level="Not assessed", reg_note=""):
     note = (reg_note or "").strip()
     rows.append(stress_row(name, {"Low": "ok", "Moderate": "watch", "High": "risk"}.get(level, "na"),
                            level + (f": {note}" if note else "."),
-                           "You set this in the sidebar. The app cannot read new laws or rulings, so it does not score "
+                           "You set this under Settings (Macro tab). The app cannot read new laws or rulings, so it does not score "
                            "regulation. Check filings and news for the company's sector and countries."))
     return rows
 
@@ -2331,6 +2543,250 @@ def funding_message(summary, cash, sym):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# 6b. LOOK AND FEEL  (version 2.4: designed for a phone screen first)
+# ══════════════════════════════════════════════════════════════════════════════
+# The blocks below are plain HTML shown with st.markdown(..., unsafe_allow_html=True). Rules that keep them safe:
+#   * every piece of text that did not come from this file goes through h(), which escapes markup, collapses white
+#     space and writes "$" as a character code (Streamlit would otherwise read $...$ as LaTeX);
+#   * each block is one line with no blank lines and no leading spaces, because markdown ends an HTML block at a blank
+#     line and turns a line indented by four spaces into code;
+#   * colours are tints of one hue over the page background, and text inherits the page colour, so a block reads the
+#     same on a light page and on a dark one (the phone's dark mode switches Streamlit's theme).
+# The CSS at the end of STYLE that touches Streamlit's own widgets is cosmetic only: if a selector stops matching in a
+# future Streamlit version the widget simply keeps its default look.
+STYLE = """
+:root{--sa-line:rgba(127,127,127,.32);--sa-fill:rgba(127,127,127,.08);--sa-track:rgba(127,127,127,.24)}
+.sa-strong{--c:#2f9e63;--bg:rgba(47,158,99,.16)}
+.sa-mixed{--c:#d99a06;--bg:rgba(217,154,6,.18)}
+.sa-weak{--c:#d64545;--bg:rgba(214,69,69,.16)}
+.sa-insufficient{--c:#8a94a3;--bg:rgba(138,148,163,.18)}
+.sa-brand{display:flex;align-items:center;gap:.7rem;margin:.1rem 0 .9rem}
+.sa-logo{flex:none;width:2.4rem;height:2.4rem;border-radius:.7rem;background:linear-gradient(135deg,#0f766e,#14a392);display:flex;align-items:center;justify-content:center}
+.sa-logo:after{content:"✓";color:#fff;font-weight:800;font-size:1.3rem;line-height:1}
+.sa-app{font-size:1.2rem;font-weight:700;line-height:1.15}
+.sa-sub{font-size:.8rem;opacity:.65;margin-top:.12rem}
+.sa-card{border:1px solid var(--sa-line);border-radius:16px;padding:16px;background:var(--sa-fill);margin:.3rem 0 .8rem}
+.sa-name{font-size:1.3rem;font-weight:700;line-height:1.2;overflow-wrap:anywhere}
+.sa-meta{font-size:.84rem;opacity:.68;margin-top:.2rem;overflow-wrap:anywhere}
+.sa-price{font-size:1.55rem;font-weight:700;line-height:1;margin-top:.85rem}
+.sa-price small{font-size:.82rem;font-weight:400;opacity:.68;margin-left:.55rem}
+.sa-h{font-size:.72rem;letter-spacing:.06em;text-transform:uppercase;opacity:.6;margin:.9rem 0 .35rem}
+.sa-kick{font-size:.72rem;letter-spacing:.06em;text-transform:uppercase;opacity:.6;margin-top:1.05rem}
+.sa-verdict{display:flex;align-items:center;justify-content:space-between;gap:.75rem;margin-top:.4rem}
+.sa-pill{display:inline-flex;align-items:center;gap:.5rem;padding:.42rem .95rem;border-radius:999px;font-weight:700;font-size:1.02rem;border:1.5px solid var(--c);background:var(--bg)}
+.sa-pill:before{content:"";width:.6rem;height:.6rem;border-radius:50%;background:var(--c)}
+.sa-score{font-size:1.55rem;font-weight:700;line-height:1;white-space:nowrap}
+.sa-score small{font-size:.85rem;font-weight:400;opacity:.65}
+.sa-gauge{position:relative;height:10px;border-radius:999px;margin:1.05rem 0 2.1rem}
+.sa-mark{position:absolute;top:50%;width:20px;height:20px;margin:-10px 0 0 -10px;border-radius:50%;background:#fff;border:4px solid var(--c);box-shadow:0 1px 4px rgba(0,0,0,.4)}
+.sa-tick{position:absolute;top:20px;font-size:.68rem;opacity:.62;transform:translateX(-50%);white-space:nowrap}
+.sa-reason{font-size:.88rem;line-height:1.4;overflow-wrap:anywhere}
+.sa-foot{font-size:.74rem;opacity:.55;margin-top:.75rem}
+.sa-tiles{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;margin:.4rem 0 .8rem}
+.sa-tiles .sa-tile:last-child:nth-child(odd){grid-column:1/-1}
+@media (min-width:640px){.sa-tiles.sa-four{grid-template-columns:repeat(4,minmax(0,1fr))}.sa-tiles.sa-four .sa-tile:last-child:nth-child(odd){grid-column:auto}}
+.sa-tile{border:1px solid var(--sa-line);border-radius:12px;padding:10px 12px;background:var(--sa-fill);display:flex;flex-direction:column}
+.sa-tl{font-size:.74rem;opacity:.66;overflow-wrap:anywhere}
+.sa-tv{font-size:1.2rem;font-weight:700;margin-top:.12rem;overflow-wrap:anywhere}
+.sa-ts{font-size:.76rem;opacity:.66;margin-top:.12rem;line-height:1.3}
+.sa-mini{height:5px;border-radius:99px;background:var(--sa-track);margin-top:auto;overflow:hidden}
+.sa-tile .sa-tv,.sa-tile .sa-ts{margin-bottom:.1rem}
+.sa-hasbar .sa-tv{margin-bottom:.55rem}
+.sa-mini span{display:block;height:100%;background:var(--c)}
+.sa-group{display:flex;justify-content:space-between;align-items:baseline;gap:.5rem;margin:1.1rem 0 .4rem;font-weight:700}
+.sa-group small{font-weight:600;opacity:.7;white-space:nowrap}
+.sa-row{border:1px solid var(--sa-line);border-radius:12px;padding:10px 12px;margin:0 0 6px;background:var(--sa-fill)}
+.sa-row summary{list-style:none;cursor:pointer;display:block}
+.sa-row summary::-webkit-details-marker{display:none}
+.sa-chev{flex:none;margin-left:.15rem;opacity:.5;font-size:1.1rem;line-height:1.6;transition:transform .15s}
+.sa-row[open] .sa-chev{transform:rotate(90deg)}
+.sa-note{font-size:.84rem;line-height:1.4;opacity:.85;margin-top:.55rem;padding-top:.55rem;border-top:1px solid var(--sa-line)}
+.sa-rt{display:flex;gap:.6rem;align-items:flex-start}
+.sa-rt>div{flex:1 1 auto;min-width:0}
+.sa-ref{opacity:.5;margin-right:.4rem;font-weight:500;font-size:.85rem}
+.sa-pn{font-weight:600;font-size:.95rem}
+.sa-pm{font-size:.84rem;opacity:.74;margin-top:.12rem;overflow-wrap:anywhere}
+.sa-sc{flex:none;min-width:2.2rem;text-align:center;font-weight:700;border-radius:8px;padding:.18rem .45rem;border:1.5px solid var(--c);background:var(--bg)}
+.sa-bar{height:5px;border-radius:99px;background:var(--sa-track);margin-top:.55rem;overflow:hidden}
+.sa-bar span{display:block;height:100%;background:var(--c)}
+.sa-empty{border:1px dashed var(--sa-line);border-radius:16px;padding:22px 16px;text-align:center;margin:.8rem 0}
+.sa-empty b{display:block;font-size:1.05rem;margin-bottom:.35rem}
+.sa-empty span{opacity:.7;font-size:.9rem;line-height:1.45}
+#MainMenu,footer,[data-testid="stDecoration"],[data-testid="stAppDeployButton"],.stDeployButton{display:none!important}
+.block-container,[data-testid="stMainBlockContainer"]{padding-top:1.4rem!important;padding-bottom:4rem!important}
+@media (max-width:640px){.block-container,[data-testid="stMainBlockContainer"]{padding-left:.9rem!important;padding-right:.9rem!important}}
+.stButton>button,.stDownloadButton>button,[data-testid="stFormSubmitButton"]>button{width:100%;min-height:3rem;border-radius:12px;font-weight:600}
+[data-testid="stElementContainer"]:has(.stButton),[data-testid="stElementContainer"]:has(.stDownloadButton),[data-testid="stElementContainer"]:has([data-testid="stFormSubmitButton"]),[data-testid="stElementContainer"]:has([data-testid="stButtonGroup"]){width:100%!important}
+[data-testid="stButtonGroup"]{width:100%}
+[data-testid="stButtonGroup"] button{flex:1 1 auto;min-width:max-content;min-height:2.75rem;justify-content:center}
+.sa-end{height:4.5rem}
+[class*="st-key-lookup_pick_"] button{justify-content:flex-start;text-align:left;white-space:normal;height:auto;padding:.75rem 1rem}
+[data-testid="stForm"]{border:0!important;padding:0!important}
+[data-testid="stMetric"]{border:1px solid var(--sa-line);border-radius:12px;padding:10px 12px;background:var(--sa-fill)}
+[data-baseweb="tab"]{min-height:2.75rem}
+[data-testid="stExpander"] summary{min-height:3rem}
+[data-testid="stExpander"]{border-radius:12px}
+input,textarea,select{font-size:16px!important}
+html{-webkit-text-size-adjust:100%}
+button,summary,[role="tab"]{touch-action:manipulation;-webkit-tap-highlight-color:transparent}
+@media (max-width:640px){[data-testid="stHorizontalBlock"]:has([data-testid="stMetric"]){flex-wrap:wrap!important;gap:.5rem!important}[data-testid="stHorizontalBlock"]:has([data-testid="stMetric"])>[data-testid="stColumn"],[data-testid="stHorizontalBlock"]:has([data-testid="stMetric"])>[data-testid="column"]{min-width:calc(50% - .5rem)!important;flex:1 1 calc(50% - .5rem)!important}}
+"""
+
+RESULT_KINDS = ("strong", "mixed", "weak", "insufficient")
+PLOT_CONFIG = {"displayModeBar": False, "scrollZoom": False}   # no toolbar, and a swipe over a chart still scrolls the page
+
+
+def h(text):
+    """Text made safe for the HTML blocks in this section: markup escaped, white space collapsed to single spaces, and
+    dollar signs written as character codes so that Streamlit's markdown cannot read them as LaTeX."""
+    return html_lib.escape(" ".join(str(text).split()), quote=True).replace("$", "&#36;")
+
+
+def band(score):
+    """The colour band of a score: the same cut-offs as the result (Strong from STRONG_MIN, Mixed from MIXED_MIN)."""
+    if score is None:
+        return "insufficient"
+    return "strong" if score >= STRONG_MIN else "mixed" if score >= MIXED_MIN else "weak"
+
+
+def show_html(block):
+    st.markdown(block, unsafe_allow_html=True)
+
+
+def show_style():
+    show_html(f"<style>{STYLE}</style>")
+
+
+def brand_html():
+    return ('<div class="sa-brand"><div class="sa-logo"></div><div><div class="sa-app">Anti-Fragile Screener</div>'
+            '<div class="sa-sub">Stock and startup screening · research only</div></div></div>')
+
+
+IDLE_TEXT = {
+    MODE_PUBLIC: ("Search a company to begin",
+                  "Type a company name or a ticker symbol above, then tap Run audit. Try Apple, NVDA, Tata Motors or RELIANCE.NS."),
+    MODE_VENTURE: ("Run the growth lens",
+                   "Type a listed company or enter your own startup numbers above, then tap Run audit."),
+    MODE_MACRO: ("Load the macro backdrop",
+                 "Tap Load backdrop to read US and India rates, inflation and market signals side by side."),
+}
+
+
+def empty_html(mode=MODE_PUBLIC):
+    """What the page says before anything has been run."""
+    title, text = IDLE_TEXT.get(mode, IDLE_TEXT[MODE_PUBLIC])
+    return f'<div class="sa-empty"><b>{h(title)}</b><span>{h(text)}</span></div>'
+
+
+def gauge_html(score):
+    """The score on a 0 to 5 scale, split into the Weak, Mixed and Strong bands with a marker at the score."""
+    lo, hi = MIXED_MIN / 5 * 100, STRONG_MIN / 5 * 100
+    red, amber, green = "rgba(214,69,69,.5)", "rgba(217,154,6,.5)", "rgba(47,158,99,.5)"
+    zones = (f"linear-gradient(90deg,{red} 0%,{red} {lo:g}%,{amber} {lo:g}%,{amber} {hi:g}%,{green} {hi:g}%,{green} 100%)")
+    mark = "" if score is None else f'<span class="sa-mark" style="left:{min(max(score / 5 * 100, 0), 100):.1f}%"></span>'
+    return (f'<div class="sa-gauge" style="background:{zones}">{mark}'
+            f'<span class="sa-tick" style="left:{lo / 2:g}%">Weak</span>'
+            f'<span class="sa-tick" style="left:{(lo + hi) / 2:g}%">Mixed</span>'
+            f'<span class="sa-tick" style="left:{(hi + 100) / 2:g}%">Strong</span></div>')
+
+
+def head_html(name, meta="", price=None):
+    """Who the page is about: the name, one line of facts, and the price with the market cap beside it."""
+    out = f'<div class="sa-name">{h(name)}</div>'
+    if meta:
+        out += f'<div class="sa-meta">{h(meta)}</div>'
+    if price:
+        out += f'<div class="sa-price">{h(price[0])}' + (f"<small>{h(price[1])}</small>" if price[1] else "") + "</div>"
+    return out
+
+
+def hero_html(name, meta, price, kind, label, score, reason, foot=""):
+    """The card a result opens on: who it is, the rating, the score on its gauge, and the reason in one line."""
+    if kind not in RESULT_KINDS:
+        raise ValueError(f"unknown result kind {kind!r}")
+    shown = "" if score is None else f'<div class="sa-score">{score:.2f}<small> / 5</small></div>'
+    verdict = f'<div class="sa-kick">Screen result</div><div class="sa-verdict"><span class="sa-pill">{h(label)}</span>{shown}</div>'
+    gauge = gauge_html(score) if score is not None and kind != "insufficient" else '<div style="height:.7rem"></div>'
+    tail = f'<div class="sa-foot">{h(foot)}</div>' if foot else ""
+    return (f'<div class="sa-card sa-{kind}">{head_html(name, meta, price)}{verdict}{gauge}'
+            f'<div class="sa-reason">{h(reason)}</div>{tail}</div>')
+
+
+def tile_html(label, value, sub="", score=None):
+    """One number tile. With a score (0 to 5) it also draws a thin bar in that score's colour."""
+    bar = "" if score is None else f'<div class="sa-mini"><span style="width:{min(max(score / 5 * 100, 0), 100):.0f}%"></span></div>'
+    klass = "" if score is None else f" sa-hasbar sa-{band(score)}"
+    sub_html = f'<div class="sa-ts">{h(sub)}</div>' if sub else ""
+    return f'<div class="sa-tile{klass}"><div class="sa-tl">{h(label)}</div><div class="sa-tv">{h(value)}</div>{sub_html}{bar}</div>'
+
+
+def tiles_html(tiles, four=False):
+    """A grid of tiles: two across on a phone. With four=True it is four across on a wide screen."""
+    return f'<div class="sa-tiles{" sa-four" if four else ""}">{"".join(tiles)}</div>'
+
+
+def group_tiles_html(groups):
+    tiles = [tile_html(g, "n/a" if v is None else f"{v:.2f} / 5", "", v) for g, v in groups.items()]
+    return '<div class="sa-h">Score by group</div>' + tiles_html(tiles, four=True)
+
+
+def pillar_rows_html(pillars):
+    """Every pillar as a compact row: name, the figure behind it, its score, and a bar. Tapping a row opens its caveat."""
+    _, _, group_scores = summarize(pillars)
+    out = ['<div class="sa-rows">']
+    for g in dict.fromkeys(p.group for p in pillars):
+        gs = group_scores.get(g)
+        out.append(f'<div class="sa-group"><span>{h(g)}</span><small>{"n/a" if gs is None else f"{gs:.2f} / 5"}</small></div>')
+        for p in (q for q in pillars if q.group == g):
+            shown = "-" if p.score is None else str(p.score)
+            width = 0 if p.score is None else p.score * 20
+            head = (f'<div class="sa-rt"><div><span class="sa-ref">{h(p.ref)}</span><span class="sa-pn">{h(p.name)}</span>'
+                    f'<div class="sa-pm">{h(p.display)} · weight {p.weight:.0f}%</div></div>'
+                    f'<span class="sa-sc">{h(shown)}</span>' + ('<span class="sa-chev">&rsaquo;</span>' if p.note else "") +
+                    f'</div><div class="sa-bar"><span style="width:{width}%"></span></div>')
+            if p.note:
+                out.append(f'<details class="sa-row sa-{band(p.score)}"><summary>{head}</summary><div class="sa-note">{h(p.note)}</div></details>')
+            else:
+                out.append(f'<div class="sa-row sa-{band(p.score)}">{head}</div>')
+    out.append("</div>")
+    return "".join(out)
+
+
+def macro_rows_html(rows):
+    """The macro readings as rows: indicator, reading, when and where from, and whether its caution rule is active.
+    Tapping a row shows the rule."""
+    out = ['<div class="sa-rows">']
+    for r in rows:
+        sig = r["signal"]
+        kind = "insufficient" if sig is None else "weak" if sig else "strong"
+        badge = "n/a" if sig is None else "Caution" if sig else "Clear"
+        from_where = " · ".join(x for x in ("as of " + r["as_of"] if r["as_of"] else "", r["source"] or "") if x)
+        line = h(r["disp"]) + (" · " + h(from_where) if from_where else "")
+        head = (f'<div class="sa-rt"><div><span class="sa-pn">{h(r["label"])}</span><div class="sa-pm">{line}</div></div>'
+                f'<span class="sa-sc">{badge}</span>' + ('<span class="sa-chev">&rsaquo;</span>' if r["rule"] else "") + "</div>")
+        if r["rule"]:
+            out.append(f'<details class="sa-row sa-{kind}"><summary>{head}</summary>'
+                       f'<div class="sa-note">Caution when: {h(r["rule"])}</div></details>')
+        else:
+            out.append(f'<div class="sa-row sa-{kind}">{head}</div>')
+    out.append("</div>")
+    return "".join(out)
+
+
+def style_chart(fig, height=300):
+    """Phone-sized chart: short, tight margins, legend underneath, and nothing that grabs a finger (no drag, no zoom)."""
+    fig.update_layout(height=height, margin=dict(l=8, r=8, t=48, b=8), dragmode=False, title_font_size=14,
+                      legend=dict(orientation="h", y=-0.22, x=0))
+    fig.update_xaxes(fixedrange=True)
+    fig.update_yaxes(fixedrange=True)
+    return fig
+
+
+def show_chart(fig):
+    st.plotly_chart(fig, config=PLOT_CONFIG)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # 7. UI HELPERS
 # ══════════════════════════════════════════════════════════════════════════════
 def pillar_dataframe(pillars):
@@ -2348,58 +2804,34 @@ def pillar_dataframe(pillars):
     ])
 
 
-def pillar_chart(pillars, title):
-    scored = [p for p in pillars if p.score is not None]
-    if not scored:
-        return None
-    df = pd.DataFrame({
-        "Pillar": [f"{p.ref} {p.name}" for p in scored],
-        "Score": [p.score for p in scored],
-        "Metric": [p.display for p in scored],
-    })
-    fig = px.bar(df, x="Score", y="Pillar", orientation="h", color="Score", color_continuous_scale="Teal",
-                 range_color=[1, 5], range_x=[0, 5], text="Metric", title=title)
-    fig.update_traces(textposition="auto", cliponaxis=False)
-    fig.update_yaxes(categoryorder="array", categoryarray=list(reversed(df["Pillar"].tolist())))
-    fig.update_layout(height=max(320, 34 * len(df) + 120), coloraxis_showscale=False,
-                      margin=dict(l=10, r=10, t=50, b=10))
-    return fig
-
-
-def show_verdict(kind, label, reason):
-    say({"strong": "success", "mixed": "warning", "weak": "error", "insufficient": "info"}[kind],
-        f"**Screen result: {label}.** {reason}")
-
-
 def show_findings(hard, soft, flags):
-    c1, c2 = st.columns(2)
-    with c1:
-        st.markdown("#### 🚧 Safety gates")
-        if not (hard or soft):
-            say("success", "No safety gate triggered by the available data.")
-        for title, detail in hard:
-            say("error", f"**{title}.** {detail} Hard gate: caps the result at Weak.")
-        for title, detail in soft:
-            say("warning", f"**{title}.** {detail} Soft gate: caps the result at Mixed.")
-    with c2:
-        st.markdown("#### 🚩 Red flags")
-        if not flags:
-            say("success", "No red flag triggered by the available data.")
-        for title, detail in flags:
-            say("warning", f"**{title}.** {detail}")
+    """Safety gates, then red flags, one under the other (two columns do not fit a phone)."""
+    st.markdown("#### Safety gates")
+    if not (hard or soft):
+        say("success", "No safety gate triggered by the available data.")
+    for title, detail in hard:
+        say("error", f"**{title}.** {detail} Hard gate: caps the result at Weak.")
+    for title, detail in soft:
+        say("warning", f"**{title}.** {detail} Soft gate: caps the result at Mixed.")
+    st.markdown("#### Red flags")
+    if not flags:
+        say("success", "No red flag triggered by the available data.")
+    for title, detail in flags:
+        say("warning", f"**{title}.** {detail}")
 
 
 def show_scorecard(pillars, filename, title):
-    fig = pillar_chart(pillars, title)
-    if fig is not None:
-        st.plotly_chart(fig)
+    """The pillars as tappable rows. The full table and its CSV download sit in a folded panel underneath."""
+    st.caption(f"{title}. Tap a row to see why it matters.")
+    show_html(pillar_rows_html(pillars))
     missing = [f"{p.ref} {p.name}" for p in pillars if p.score is None]
     if missing:
         st.caption("Left out of the score because no usable data was found: " + ", ".join(missing) + ".")
-    df = pillar_dataframe(pillars)
-    st.dataframe(df, hide_index=True)
-    st.download_button("Download scorecard (CSV)", df.to_csv(index=False).encode("utf-8"),
-                       file_name=filename, mime="text/csv")
+    with st.expander("Table view and download"):
+        df = pillar_dataframe(pillars)
+        st.dataframe(df, hide_index=True)
+        st.download_button("Download scorecard (CSV)", df.to_csv(index=False).encode("utf-8"),
+                           file_name=filename, mime="text/csv")
 
 
 def raw_inputs_table(m):
@@ -2413,8 +2845,8 @@ def raw_inputs_table(m):
         ("Total debt", fmt_big(m["total_debt"], fs)),
         ("Cash and short-term investments", fmt_big(m["cash"], fs)),
         ("Book equity (latest annual)", fmt_big(m["equity"], fs)),
-        ("Trailing EPS", fmt_price(m["eps_ttm"], s)),
-        ("Trailing P/E", fmt_x(m["pe_ttm"])),
+        ("EPS (latest annual, rebuilt)" if m.get("reduced") else "Trailing EPS", fmt_price(m["eps_ttm"], s)),
+        ("P/E (on the latest annual EPS)" if m.get("reduced") else "Trailing P/E", fmt_x(m["pe_ttm"])),
         (f"PEG ({m['peg_source']})", fmt_x(m["peg"], 2)),
         ("Revenue CAGR", "n/a" if m["rev_cagr"] is None else f"{fmt_pct(m['rev_cagr'])} over {m['rev_years']} years"),
         ("Net income CAGR", "n/a" if m["ni_cagr"] is None else f"{fmt_pct(m['ni_cagr'])} over {m['ni_years']} years"),
@@ -2434,7 +2866,7 @@ def show_forward(m, fwd, msg, cfg, rates=None, fixed=None):
     s, fs = m["sym"], m["fin_sym"]
     floor = cfg.get("min_pe", MIN_PE)
     floor_txt = f"{floor:.0f}" if floor == MIN_PE else f"{floor:.1f}"
-    st.caption("Illustrative model, not a forecast. Every assumption is listed below and can be changed in the sidebar.")
+    st.caption("Illustrative model, not a forecast. Every assumption is listed below and can be changed under Settings.")
     if rates is not None:  # a rate link that fell back to the fixed values is never silent
         for note in rates["notes"]:
             say("warning", note)
@@ -2445,6 +2877,13 @@ def show_forward(m, fwd, msg, cfg, rates=None, fixed=None):
             f"For comparison, the fixed assumptions ({fmt_rate(fixed['req_return'])} required return, {fixed['min_pe']:.0f}x floor) "
             f"would give a fair value of {fmt_price(fixed['fair'], s)} and a max entry price of {fmt_price(fixed['entry'], s)}."
         ))
+    show_html(tiles_html([
+        tile_html("Fair value today (model)", fmt_price(fwd["fair"], s)),
+        tile_html("Max entry price", fmt_price(fwd["entry"], s), "Fair value less the margin of safety"),
+        tile_html("Implied annual return at today's price", f"{fwd['implied'] * 100:+.1f}%",
+                  "Price return only (dividends excluded), if the year-2 target is reached"),
+        tile_html("Analyst consensus target", fmt_price(m["analyst_target"], s), "Shown for reference only; not used"),
+    ], four=True))
     df = pd.DataFrame({
         "Period": ["Today (TTM)", "Year 1", "Year 2"],
         "EPS": [fmt_price(x, s) for x in fwd["eps"]],
@@ -2453,12 +2892,6 @@ def show_forward(m, fwd, msg, cfg, rates=None, fixed=None):
         "Price (today) / target": [fmt_price(x, s) for x in fwd["prices"]],
     })
     st.dataframe(df, hide_index=True)
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Fair value today (model)", fmt_price(fwd["fair"], s))
-    c2.metric("Max entry price", fmt_price(fwd["entry"], s), help="Fair value less the margin of safety.")
-    c3.metric("Implied annual return at today's price", f"{fwd['implied'] * 100:+.1f}%",
-              help="Price return only (dividends excluded), if the year-2 target is reached.")
-    c4.metric("Analyst consensus target", fmt_price(m["analyst_target"], s), help="Shown for reference only; not used.")
     st.caption(esc(
         f"Growth used: {fwd['g'] * 100:.1f}% (basis: {cfg['growth_basis'].split(':')[0].lower()}; raw {fwd['g_raw'] * 100:.1f}%, "
         f"floored at 0 and capped at {cfg['max_growth'] * 100:.0f}%). Year-2 growth fades to {EPS_GROWTH_FADE:.0%} of that. "
@@ -2469,12 +2902,11 @@ def show_forward(m, fwd, msg, cfg, rates=None, fixed=None):
         "the entry price. Read it as what you would have to believe, not as a price target."
     ))
     bars = pd.DataFrame({
-        "Item": ["Price today", "Year-1 target", "Year-2 target", "Fair value today", "Max entry price"],
+        "Item": ["Today", "Year 1", "Year 2", "Fair value", "Entry price"],
         "Value": [fwd["prices"][0], fwd["prices"][1], fwd["prices"][2], fwd["fair"], fwd["entry"]],
     })
     fig = px.bar(bars, x="Item", y="Value", text=bars["Value"].map(lambda v: f"{v:,.2f}"), title="Price vs model values")
-    fig.update_layout(height=360, margin=dict(l=10, r=10, t=50, b=10))
-    st.plotly_chart(fig)
+    show_chart(style_chart(fig, 300))
     if rates is not None:
         show_rate_sensitivity(m, cfg, rates)
 
@@ -2530,13 +2962,15 @@ def show_macro_market(title, rows, y10, mc, market):
     known = sum(1 for r in rows if r["signal"] is not None)
     st.subheader(title)
     st.markdown(f"**{active} of {known} caution signals active.**" if known else "**No caution signal could be read.**")
-    st.dataframe(macro_dataframe(rows), hide_index=True)
+    show_html(macro_rows_html(rows))
+    with st.expander(f"{title}: table view"):
+        st.dataframe(macro_dataframe(rows), hide_index=True)
     if y10 is not None:
         r = linked_required_return(y10, mc["erp"])
         g = mc["g_us"] if market == "US" else mc["g_in"]
         st.caption(esc(
             f"If the rate links are ticked in the screen, a stock priced in this market would use a required return of "
-            f"{fmt_rate(r)} and an exit-multiple floor of {linked_floor(r, g):.1f}x, instead of the fixed sidebar return "
+            f"{fmt_rate(r)} and an exit-multiple floor of {linked_floor(r, g):.1f}x, instead of the fixed required return "
             f"and the fixed {MIN_PE:.0f}x floor."
         ))
 
@@ -2688,7 +3122,7 @@ def show_context(ctx, m, filings=None):
 
     if ctx["since"]:
         st.subheader(f"Since {ctx['since']['date']}")
-        st.caption("How far the price has moved since the date you entered in the sidebar, and how much of that is still held.")
+        st.caption("How far the price has moved since the date you entered under Settings, and how much of that is still held.")
         st.dataframe(ctx_since_frame(ctx), hide_index=True)
         d_stock, d_sector = ctx["since"]["stock"], ctx["since"]["sector"]
         if d_stock and d_sector:
@@ -2715,7 +3149,7 @@ def show_context(ctx, m, filings=None):
             "Equal-weighted averages of the series that loaded. This shows whether money has recently favoured the safer "
             "sectors or the growth-sensitive ones. It describes the past; it does not predict a recession or a boom."))
         st.caption("A fund or index covers a whole sector. A narrower theme (off-price retail, say) can move differently, so "
-                   "type a narrower symbol in the sidebar if you want to compare against one.")
+                   "type a narrower symbol under Settings (Context tab) if you want to compare against one.")
 
     if ctx["info"]:
         st.subheader("Ownership and positioning")
@@ -2786,10 +3220,10 @@ FILINGS_MESSAGES = {
     "not_us": "SEC filings cover US-registered companies. This app does not fetch exchange announcements for Indian or "
               "other non-US stocks, so for those read the company's own announcements on its investor-relations page "
               "and in the exchange's announcements section.",
-    "needs_contact": "To list this company's filings, type a contact email in the sidebar (under Sector & market "
-                     "context) and click Run audit again. The SEC asks every automated request to carry one. It is sent "
+    "needs_contact": "To list this company's filings, type a contact email under Settings (Context tab) "
+                     "and tap Run audit again. The SEC asks every automated request to carry one. It is sent "
                      "to the SEC only, and kept only for this session.",
-    "bad_contact": "The contact email in the sidebar does not look like an email address, so nothing was sent to the SEC.",
+    "bad_contact": "The contact email under Settings does not look like an email address, so nothing was sent to the SEC.",
     "error": "The SEC filings could not be loaded just now. The rest of this tab is unaffected. A refusal (HTTP 403) "
              "usually means the SEC did not accept the contact email or is limiting requests, so check the address "
              "and try again in a minute.",
@@ -2899,14 +3333,42 @@ def show_filings(fl):
 # ══════════════════════════════════════════════════════════════════════════════
 def render_excluded(m, why):
     s = m["sym"]
-    st.subheader(f"{m['name']} ({m['ticker']})")
+    meta = " · ".join(x for x in (m["ticker"], m["sector"], m["industry"]) if x and x != "Unknown")
+    show_html(f'<div class="sa-card">{head_html(m["name"], meta)}</div>')
     say("warning", f"**The screen is not applicable to the {m['sector']} sector.** {why}")
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Price", fmt_price(m["price"], s))
-    c2.metric("Market cap", fmt_big(m["market_cap"], s))
-    c3.metric("Trailing P/E", fmt_x(m["pe_ttm"]))
-    c4.metric("Price / book", fmt_x(m["pb"], 2))
-    say("info", "To run the screen anyway (results will be unreliable), tick the box in the sidebar and click Run audit again.")
+    show_html(tiles_html([
+        tile_html("Price", fmt_price(m["price"], s)),
+        tile_html("Market cap", fmt_big(m["market_cap"], s)),
+        tile_html("Trailing P/E", fmt_x(m["pe_ttm"])),
+        tile_html("Price / book", fmt_x(m["pb"], 2)),
+    ], four=True))
+    say("info", "To run the screen anyway (results will be unreliable), turn on the Run anyway box under Settings "
+                "(Screen tab) and tap Run audit again.")
+
+
+def show_reduced(reduced):
+    """The notice for reduced-data mode: Yahoo's quote service refused, so the figures were rebuilt from other services."""
+    say("warning", "**Reduced-data mode.** Yahoo's quote service is not answering for this symbol, so the figures were "
+                   "rebuilt from the annual statements and the price history. This is a rougher screen than usual: some "
+                   "figures are annual rather than trailing twelve months, and analyst and insider data are missing. "
+                   "Tap Run audit again later for the full version.")
+    with st.expander("What was rebuilt, and why"):
+        st.markdown("\n".join(f"- {md_plain(n)}" for n in reduced.get("notes") or []))
+        st.caption(f"Why: {md_plain(reduced.get('why') or 'not recorded')}")
+        if reduced.get("errors"):
+            st.caption(f"Also refused or missing: {md_plain('; '.join(reduced['errors']))}")
+
+
+def render_unverified(m):
+    """Reduced-data mode with no sector: the check that keeps banks, insurers and real-estate companies out cannot run."""
+    s = m["sym"]
+    show_html(f'<div class="sa-card">{head_html(m["name"], m["ticker"])}</div>')
+    say("warning", "**The sector could not be confirmed.** Yahoo's quote service is not answering, and its search service "
+                   "gave no sector either. The screen keeps banks, insurers and real-estate companies out because its "
+                   "rubric does not fit them, and it cannot check that without the sector. Try again in a few minutes. "
+                   "To run it anyway (results will be unreliable if the company is a lender or a REIT), turn on the Run "
+                   "anyway box under Settings (Screen tab) and tap Run audit again.")
+    show_html(tiles_html([tile_html("Price", fmt_price(m["price"], s)), tile_html("Data fetched", m["fetched_at"] or "n/a")]))
 
 
 def render_public(m, cfg):
@@ -2930,11 +3392,13 @@ def render_public(m, cfg):
     except Exception:  # noqa: BLE001 - same rule: the stress tests are an extra, not part of the screen
         stress = None
 
-    st.subheader(f"{m['name']} ({m['ticker']})")
-    st.caption(esc(
-        f"{m['sector']}, {m['industry']}. Price {fmt_price(m['price'], s)}, market cap {fmt_big(m['market_cap'], s)}. "
-        f"Yahoo Finance data fetched {m['fetched_at']}."
-    ))
+    meta = " · ".join(x for x in (m["ticker"], m["sector"], m["industry"]) if x and x != "Unknown")
+    foot = (f"Rebuilt without Yahoo's quote service, data fetched {m['fetched_at']}." if m.get("reduced")
+            else f"Yahoo Finance data fetched {m['fetched_at']}.")
+    show_html(hero_html(m["name"], meta, (fmt_price(m["price"], s), f"Market cap {fmt_big(m['market_cap'], s)}"),
+                        kind, label, score, reason, foot))
+    if m.get("reduced"):
+        show_reduced(m["reduced"])
     rule = sector_rule(m["sector"], m["industry"])
     if rule:
         extra = " You chose to run it anyway, so treat the result as unreliable." if rule[0] == "exclude" else ""
@@ -2943,33 +3407,25 @@ def render_public(m, cfg):
         say("warning", f"The price is in {m['currency']} but financials are reported in {m['fin_currency']}. "
                        "FCF yield and the forward valuation are skipped to avoid mixing currencies.")
 
-    c1, c2, c3, c4 = st.columns(4)
     have = sum(1 for p in pillars if p.score is not None)
-    c1.metric("Screen result", label)
-    c2.metric("Composite score", "n/a" if score is None else f"{score:.2f} / 5")
-    c3.metric("Data coverage", f"{coverage:.0%}",
-              help=f"{have} of {len(pillars)} pillars had data. Missing pillars are left out and the remaining weights are rescaled.")
     if fwd:
-        c4.metric("Model entry price", fmt_price(fwd["entry"], s),
-                  delta=f"{(m['price'] / fwd['entry'] - 1) * 100:+.1f}% price vs entry", delta_color="inverse",
-                  help="From the illustrative forward model in the second tab. Not an analyst target.")
+        entry = tile_html("Model entry price", fmt_price(fwd["entry"], s), f"Price is {(m['price'] / fwd['entry'] - 1) * 100:+.1f}% vs entry")
     else:
-        c4.metric("Model entry price", "n/a", help=fwd_msg)
-    show_verdict(kind, label, reason)
-
-    for col, (g, v) in zip(st.columns(len(groups)), groups.items()):
-        col.metric(g, "n/a" if v is None else f"{v:.2f} / 5")
+        entry = tile_html("Model entry price", "n/a", "No model value for this stock")
+    show_html(tiles_html([tile_html("Data coverage", f"{coverage:.0%}", f"{have} of {len(pillars)} pillars had data"), entry]))
+    show_html(group_tiles_html(groups))
     show_findings(hard, soft, flags)
 
     flagged = bool(stress) and any(r["status"] == "risk" for r in stress)
     show_ctx = bool(cfg.get("show_context"))
-    tab_names = ["Scorecard", "Forward valuation (illustrative)", "Stress tests (info only)" + (" ⚠" if flagged else "")]
+    tab_names = ["Scorecard", "Valuation", "Stress tests" + (" ⚠" if flagged else "")]
     if show_ctx:
-        tab_names.append("Sector & market context (info only)")
-    tabs = st.tabs(tab_names + ["Inputs used"])
+        tab_names.append("Context")
+    tabs = st.tabs(tab_names + ["Inputs"])
     t1, t2, t3, t4 = tabs[0], tabs[1], tabs[2], tabs[-1]
     with t1:
-        show_scorecard(pillars, f"{m['ticker']}_scorecard.csv", "Pillar scores (1 = poor, 5 = excellent)")
+        show_scorecard(pillars, f"{m['ticker']}_scorecard{'_reduced' if m.get('reduced') else ''}.csv",
+                       "Pillar scores (1 = poor, 5 = excellent)")
     with t2:
         show_forward(m, fwd, fwd_msg, fcfg, rates, fixed)
     with t3:
@@ -3007,23 +3463,21 @@ def render_venture(vi, fade, cost_ratio):
                    and vi["burn"] is not None)
     df_proj, summary = project_venture(vi, fade, cost_ratio) if can_project else (None, None)
 
-    st.subheader(f"Venture growth dashboard: {vi['name']}")
     src = "Manual inputs." if vi["source"] == "manual" else f"Yahoo Finance data fetched {vi['fetched_at']}."
-    st.caption(esc(f"{src} Amounts in millions of {s.strip()}."))
+    meta = "Growth / pre-profit lens" + (f" · {vi['ticker']}" if vi.get("ticker") else "")
+    show_html(hero_html(vi["name"], meta, None, kind, label, score, reason, f"{src} Amounts in millions of {s.strip()}."))
 
     rw, bm = d["runway"], d["burn_multiple"]
-    c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("Screen result", label)
-    c2.metric("Composite score", "n/a" if score is None else f"{score:.2f} / 5")
-    c3.metric("Cash runway", "n/a" if rw is None else "Self-funding" if math.isinf(rw) else f"{rw:.0f} months")
-    c4.metric("Burn multiple", "n/a" if bm is None else "Self-funding" if bm == 0 else "No net new revenue"
-              if math.isinf(bm) else f"{bm:.2f}x")
-    c5.metric("Data coverage", f"{coverage:.0%}",
-              help="Share of pillar weight that has data. Missing pillars are left out and the rest rescaled.")
-    show_verdict(kind, label, reason)
+    runway = "n/a" if rw is None else "Self-funding" if math.isinf(rw) else f"{rw:.0f} months"
+    burn = "n/a" if bm is None else "Self-funding" if bm == 0 else "No net new revenue" if math.isinf(bm) else f"{bm:.2f}x"
+    show_html(tiles_html([
+        tile_html("Cash runway", runway),
+        tile_html("Burn multiple", burn),
+        tile_html("Data coverage", f"{coverage:.0%}", "Share of pillar weight that has data"),
+    ]))
     show_findings(hard, soft, flags)
 
-    t1, t2, t3 = st.tabs(["Scorecard", "Projection and breakeven", "Inputs and derived metrics"])
+    t1, t2, t3 = st.tabs(["Scorecard", "Projection", "Inputs"])
     with t1:
         show_scorecard(pillars, f"{vi['name'].replace(' ', '_')}_venture_scorecard.csv", "Venture pillar scores (1 = poor, 5 = excellent)")
     with t2:
@@ -3031,7 +3485,7 @@ def render_venture(vi, fade, cost_ratio):
             say("info", "A projection needs revenue, growth, gross margin and net burn. Fill in the missing inputs.")
         else:
             st.caption("Illustrative operating model, not a forecast. Growth fades each year and the cost base grows "
-                       "more slowly than revenue (operating leverage). Change both in the sidebar.")
+                       "more slowly than revenue (operating leverage). Change both under Projection assumptions.")
             level, text = breakeven_message(summary)
             say(level, f"**Breakeven.** {text}")
             level, text = funding_message(summary, vi["cash"], s)
@@ -3040,16 +3494,15 @@ def render_venture(vi, fade, cost_ratio):
                                 var_name="Series", value_name="Amount")
             fig = px.line(long, x="Year", y="Amount", color="Series", markers=True,
                           title="Revenue, gross profit and cash costs (millions)")
-            fig.update_layout(height=400, margin=dict(l=10, r=10, t=50, b=10))
-            st.plotly_chart(fig)
+            show_chart(style_chart(fig, 320))
             if not df_proj["Cash"].isna().all():
                 cash_df = df_proj[["Year", "Cash"]].copy()
                 cash_df["Status"] = ["Funded" if v >= 0 else "Shortfall" for v in cash_df["Cash"]]
                 fig2 = px.bar(cash_df, x="Year", y="Cash", color="Status",
                               color_discrete_map={"Funded": "#0EA5E9", "Shortfall": "#DC2626"},
-                              title="Projected cash balance (millions); below zero means new funding is needed")
-                fig2.update_layout(height=320, margin=dict(l=10, r=10, t=50, b=10))
-                st.plotly_chart(fig2)
+                              title="Projected cash balance (millions)")
+                show_chart(style_chart(fig2, 280))
+                st.caption("A bar below zero means new funding is needed.")
             show = df_proj.copy()
             show["Year"] = ["Today"] + [f"Year {i}" for i in range(1, PROJECTION_YEARS + 1)]
             for col in ("Revenue", "Gross profit", "Cash costs", "Net burn", "Cash"):
@@ -3081,12 +3534,12 @@ def explain_error(exc):
     text = f"{type(exc).__name__}: {exc}"
     if any(k in text for k in ("RateLimit", "Too Many Requests", "429")):
         return ("Yahoo Finance is rate-limiting this server, which is common on shared cloud hosts. "
-                "Wait a minute and click Run audit again. Data that was fetched successfully is cached for an hour.")
+                "Wait a minute and tap Run audit again. Data that was fetched successfully is cached for an hour.")
     return f"The analysis could not be completed. {text}"
 
 
 def macro_inputs():
-    """Sidebar inputs shared by the rate links, the stress tests and the macro panel. The boxes show percent; the
+    """Inputs shared by the rate links, the stress tests and the macro panel. The boxes show percent; the
     returned dict holds fractions (None = left blank)."""
     frac = lambda v: None if v is None else v / 100
     mc = {
@@ -3115,117 +3568,489 @@ def macro_inputs():
     return mc
 
 
-def sidebar():
-    sb = st.sidebar
-    sb.header("Configuration")
-    mode = sb.radio("Evaluation mode", [MODE_PUBLIC, MODE_VENTURE, MODE_MACRO])
-    cfg = {"mode": mode}
-    if mode == MODE_PUBLIC:
-        cfg["ticker"] = sb.text_input(
-            "Ticker", value="NVDA", help="US: AAPL. India NSE: RELIANCE.NS. India BSE: 500325.BO."
-        ).strip().upper()
-        cfg["loss_handling"] = sb.selectbox(
-            "If trailing net income is zero or negative", LOSS_OPTIONS,
-            help=f"Auto sends loss-makers with revenue growth of {ROUTE_GROWTH_MIN:.0%} or more to the venture lens. "
-                 "Other loss-makers stay in the screen, where a hard gate caps them at Weak.")
-        cfg["allow_excluded"] = sb.checkbox(
-            "Run anyway for banks, insurers and REITs", value=False,
-            help="The rubric does not fit these sectors. Results will be unreliable.")
-        with sb.expander("Valuation assumptions"):
-            cfg["mos"] = st.slider("Margin of safety", 0.05, 0.50, 0.20, 0.05)
-            cfg["req_return"] = st.slider("Required annual return", 0.08, 0.20, 0.10, 0.01)
-            cfg["growth_basis"] = st.selectbox("Growth basis", list(GROWTH_BASES))
-            cfg["max_growth"] = st.slider("Maximum growth assumed", 0.05, 0.40, 0.20, 0.01)
-            cfg["target_peg"] = st.slider("Target PEG for the exit multiple", 0.8, 2.5, 1.5, 0.1)
-            cfg["max_pe"] = st.slider("Maximum exit P/E", 12.0, 45.0, 30.0, 1.0)
-        with sb.expander("Macro overlay (optional)"):
-            st.caption("Everything here is off by default. With both boxes unticked, scores and the forward valuation "
-                       "are exactly as before.")
-            cfg["link_r"] = st.checkbox(
-                "Tie the required return to the 10-year yield", value=False, key="link_r",
-                help="Required return = 10-year government yield + equity risk premium. US-dollar stocks use the US yield "
-                     "(live, or typed in below); Indian stocks use the India yield typed in below. The fixed slider "
-                     "above is the fallback when no yield is available.")
-            cfg["link_floor"] = st.checkbox(
-                "Tie the exit-multiple floor to rates", value=False, key="link_floor",
-                help=f"Replaces the fixed {MIN_PE:.0f}x floor with 1 / (required return - long-run growth), kept between "
-                     f"{FLOOR_PE_MIN:.0f}x and {FLOOR_PE_MAX:.0f}x.")
-            cfg["macro"] = macro_inputs()
-            cfg["reg_level"] = st.selectbox(
-                "Regulatory or policy exposure (your view)", REG_LEVELS, key=f"reg_level_{cfg['ticker']}",
-                help="Shown in the stress tests for this ticker. Never scored.")
-            cfg["reg_note"] = st.text_input("Regulation note (optional)", value="", max_chars=140,
-                                            key=f"reg_note_{cfg['ticker']}")
-        with sb.expander("Sector & market context (optional)"):
-            st.caption("Off by default. Adds a tab with the stock's sector against the market, trend health, how the sector "
-                       "held up in past sell-offs, an all-sector leaderboard, headlines and a research checklist. "
-                       "Information only: the rating never changes.")
-            cfg["show_context"] = st.checkbox(
-                "Show the sector & market context tab", value=False, key="show_ctx",
-                help="Fetches price history for the stock, its sector and the market from Yahoo Finance when you click Run audit.")
-            cfg["ctx_board"] = st.checkbox(
-                "Include the all-sector leaderboard", value=True, key="ctx_board",
-                help="Ranks every sector by recent performance. Fetches about ten more price series on the first run "
-                     "(then cached for three hours); untick it if Yahoo is rate-limiting you.")
-            cfg["ctx_proxy"] = st.text_input(
-                "Compare with this fund or index (optional)", value="", max_chars=20, key=f"ctx_proxy_{cfg['ticker']}",
-                help="Blank = chosen from Yahoo's sector (US: the Select Sector SPDR funds; India: NSE sector indexes). "
-                     "For a narrower theme type a Yahoo symbol, for example XRT (US retail) or SMH (semiconductors).",
-            ).strip().upper()
-            cfg["ctx_date"] = st.text_input(
-                "Catalyst date (optional, YYYY-MM-DD)", value="", max_chars=10, key=f"ctx_date_{cfg['ticker']}",
-                help="If the stock moved on news, enter the date to see how far the stock, its sector and the market have "
-                     "moved since then, and how much of the move is still held. It also starts the filings list from "
-                     "that date.").strip()
-            cfg["ctx_alloc"] = st.checkbox(
-                "Include capital-allocation numbers", value=True, key="ctx_alloc",
-                help="Asset growth, capital spending against depreciation, cash paid for acquisitions, goodwill, debt "
-                     "and share-count changes, worked out from the annual statements the app has already loaded. "
-                     "No extra fetching.")
-            cfg["ctx_filings"] = st.checkbox(
-                "Include recent SEC filings (US companies)", value=True, key="ctx_filings",
-                help="Lists the company's recent 8-K reports (agreements, completed acquisitions, equity sales, officer "
-                     "changes and so on) from SEC EDGAR. Nothing is fetched until you give a contact email below.")
-            cfg["sec_contact"] = st.text_input(
-                "Contact email for the SEC (needed for filings)", value="", max_chars=100, key="sec_contact",
-                help="The SEC asks every automated request to carry a contact email. It is sent to the SEC with each "
-                     "request and nowhere else, and is kept only for your current session. You can also set SEC_CONTACT "
-                     "in the app's secrets.").strip()
-    elif mode == MODE_MACRO:
-        sb.caption("Shows US and India readings side by side. US data loads automatically. For India, type the bond "
-                   "yield, policy rate and inflation in below.")
-        with sb.expander("Assumptions and typed-in figures", expanded=True):
-            cfg["macro"] = macro_inputs()
+# ══════════════════════════════════════════════════════════════════════════════
+# 9b. COMPANY SEARCH  (version 2.3: type a company name as well as a ticker symbol)
+# ══════════════════════════════════════════════════════════════════════════════
+SEARCH_TTL = 60 * 60           # seconds a company search stays cached
+SEARCH_FETCH = 12              # matches asked of Yahoo. Listings on other exchanges are dropped afterwards, so ask for extra
+SEARCH_MAX_OPTIONS = 8         # most companies offered in the pick-one list
+SEARCH_TIMEOUT = 10            # seconds to wait for Yahoo's search
+QUERY_MAX_CHARS = 60           # longest text sent to the search
+SYMBOL_MAX_CHARS = 24
+SYMBOL_RE = re.compile(r"\^?[A-Za-z0-9&=\-]+(?:\.[A-Za-z0-9]{1,4})?")    # AAPL, BRK-B, M&M.NS, 500325.BO
+SYMBOL_HINT = "US: AAPL. India NSE: RELIANCE.NS. India BSE: 500325.BO."
+KIND_TEXT = {                  # Yahoo quote types that are not company stocks
+    "ETF": "an ETF", "MUTUALFUND": "a mutual fund", "INDEX": "an index", "CURRENCY": "a currency pair",
+    "CRYPTOCURRENCY": "a cryptocurrency", "FUTURE": "a futures contract", "OPTION": "an options contract",
+    "MONEYMARKET": "a money-market fund",
+}
+LOOKUP_PENDING, LOOKUP_NOTICE, LOOKUP_NOTE = "lookup_pending", "lookup_notice", "lookup_note"   # session-state keys
+
+
+class SearchError(Exception):
+    """Yahoo's company search could not be used. The message is safe to show."""
+
+
+def clean_query(text):
+    """Typed text -> one line with no control characters, at most QUERY_MAX_CHARS long."""
+    if not isinstance(text, str):
+        return ""
+    text = "".join(ch if ch.isprintable() else " " for ch in text)
+    return " ".join(text.split())[:QUERY_MAX_CHARS].strip()
+
+
+def is_symbol(text):
+    """True for text shaped like a Yahoo ticker: one word of letters, digits and a few signs, with at most one exchange
+    ending (AAPL, BRK-B, M&M.NS, 500325.BO)."""
+    return (isinstance(text, str) and len(text) <= SYMBOL_MAX_CHARS and SYMBOL_RE.fullmatch(text) is not None
+            and any(ch.isalnum() for ch in text))
+
+
+def md_plain(text):
+    """Text that came from outside the app, made safe to show as markdown: no emphasis, links or LaTeX."""
+    return re.sub(r"([\\`*_\[\]~$])", r"\\\1", str(text))
+
+
+def first_word(text):
+    """First word of a name, lower-cased. It tells 'Ford Motor Company' from 'Forward Industries'."""
+    found = re.match(r"[^\W_]+", str(text).casefold())
+    return found.group(0) if found else ""
+
+
+def listing_scope(symbol):
+    """US (no ending), IN (NSE or BSE) or other. Yahoo marks every listing outside the US with an ending after a dot and
+    writes US share classes with a dash (BRK-B)."""
+    if symbol.endswith((".NS", ".BO")):
+        return "IN"
+    return "other" if "." in symbol else "US"
+
+
+def kind_text(kind):
+    if kind in KIND_TEXT:
+        return KIND_TEXT[kind]
+    return f"not a company stock (Yahoo type: {kind.lower()})" if kind else "not a company stock"
+
+
+def _text(value, limit=80):
+    """A short one-line string, or '' when the value is not text."""
+    if not isinstance(value, str):
+        return ""
+    return " ".join("".join(ch if ch.isprintable() else " " for ch in value).split())[:limit]
+
+
+def candidate_from_quote(quote):
+    """One quote from Yahoo's search -> a plain dict, or None when it cannot be used. Nothing from outside is trusted:
+    the symbol must look like a symbol, and every other field is cut to a short plain string."""
+    if not isinstance(quote, dict) or not isinstance(quote.get("symbol"), str):
+        return None
+    symbol = quote["symbol"].strip().upper()
+    if not is_symbol(symbol):
+        return None
+    kind = _text(quote.get("quoteType"), 20).upper() or _text(quote.get("typeDisp"), 20).upper()
+    return {
+        "symbol": symbol,
+        "name": _text(quote.get("longname")) or _text(quote.get("shortname")) or symbol,
+        "exchange": _text(quote.get("exchDisp"), 30) or _text(quote.get("exchange"), 12),
+        "industry": _text(quote.get("industry"), 40) or _text(quote.get("industryDisp"), 40),
+        "kind": kind,
+        "is_equity": kind in ("", "EQUITY"),      # an answer with no type at all is given the benefit of the doubt
+        "scope": listing_scope(symbol),
+        "base": symbol.split(".")[0],
+    }
+
+
+def _search_kwargs(cls):
+    """The options of yfinance's Search that the installed version understands (older versions have fewer)."""
+    wanted = {"max_results": SEARCH_FETCH, "news_count": 0, "lists_count": 0, "timeout": SEARCH_TIMEOUT}
+    try:
+        params = inspect.signature(cls).parameters
+    except (TypeError, ValueError):
+        return {"max_results": SEARCH_FETCH}
+    if any(p.kind is p.VAR_KEYWORD for p in params.values()):
+        return wanted
+    return {k: v for k, v in wanted.items() if k in params}
+
+
+def _search_quotes(query):
+    """The raw quotes of Yahoo's search for some text. Raises SearchError when Yahoo cannot be asked or answers with
+    something unusable."""
+    cls = getattr(yf, "Search", None)
+    if cls is None:
+        raise SearchError("This version of yfinance has no company search (it needs 0.2.54 or newer).")
+    try:
+        found = cls(query, **_search_kwargs(cls))
+        if not getattr(found, "response", None) and callable(getattr(found, "search", None)):
+            ran = found.search()                 # some versions search when built, others only when asked
+            found = ran if hasattr(ran, "quotes") else found
+        quotes = found.quotes
+    except Exception as exc:  # noqa: BLE001 - any network or format problem becomes one plain message
+        raise SearchError(f"Yahoo's company search did not answer ({type(exc).__name__}).") from None
+    if not isinstance(quotes, (list, tuple)):
+        raise SearchError("Yahoo's company search answered in a form this app does not understand.")
+    return quotes
+
+
+@st.cache_data(ttl=SEARCH_TTL, max_entries=64, show_spinner=False)
+def search_companies(query: str) -> list:
+    """Yahoo's search for a company name or ticker -> candidate dicts, closest first. Raises SearchError when Yahoo
+    cannot be asked or answers with something unusable, so a failure is never cached."""
+    out, seen = [], set()
+    for quote in _search_quotes(query):
+        cand = candidate_from_quote(quote)
+        if cand and cand["symbol"] not in seen:
+            seen.add(cand["symbol"])
+            out.append(cand)
+    return out
+
+
+def canonical_sector(text):
+    """Yahoo's own spelling of a sector name for text that differs from it only in capital letters, hyphens, underscores or
+    spacing, else ''. A sector this does not recognise counts as missing, so the bank and real-estate check never works from
+    a name it could not read."""
+    key = " ".join(re.sub(r"[_\-]+", " ", str(text)).split()).casefold()
+    return next((name for name in YAHOO_SECTORS if name.casefold() == key), "")
+
+
+@st.cache_data(ttl=SEARCH_TTL, max_entries=64, show_spinner=False)
+def fetch_quote_meta(symbol: str) -> dict:
+    """Name, sector and industry of one symbol from Yahoo's search service, which is a different service from the quote
+    one and can still answer when that one refuses. Raises SearchError when the search does not list the symbol, so a
+    miss is never cached."""
+    want = str(symbol).strip().upper()
+    for quote in _search_quotes(want):
+        if isinstance(quote, dict) and str(quote.get("symbol") or "").strip().upper() == want:
+            return {"name": _text(quote.get("longname")) or _text(quote.get("shortname")),
+                    "sector": canonical_sector(_text(quote.get("sector"), 40)) or canonical_sector(_text(quote.get("sectorDisp"), 40)),
+                    "industry": _text(quote.get("industry"), 40) or _text(quote.get("industryDisp"), 40)}
+    raise SearchError(f"Yahoo's search does not list {want}.")
+
+
+def _run(symbol, note=None):
+    return {"action": "run", "symbol": symbol, "note": note}
+
+
+def _choose(options, notes):
+    return {"action": "choose", "options": options[:SEARCH_MAX_OPTIONS],
+            "more": max(0, len(options) - SEARCH_MAX_OPTIONS), "notes": list(notes)}
+
+
+def _stop(kind, text):
+    return {"action": "stop", "kind": kind, "text": text}
+
+
+def decide_target(query, search=None):
+    """What a click on Run audit should do with the typed text. Returns one of
+         {"action": "run", "symbol", "note"}                analyse this symbol now
+         {"action": "choose", "options", "more", "notes"}   ask which company is meant
+         {"action": "stop", "kind", "text"}                 nothing to run: show the message
+    A symbol with an exchange ending (TCS.NS, 7203.T) names one listing, so it is used as typed with no search. Anything
+    else is looked up on Yahoo. A clear ticker runs straight away. A name that fits exactly one US or Indian company
+    runs with a note saying what it matched. Anything that could mean more than one company asks. If the lookup fails, a
+    symbol-shaped text is used as typed, exactly as version 2.2 did."""
+    q = clean_query(query)
+    if not q:
+        return _stop("error", "Type a company name or a ticker symbol in the search box, then tap Run audit.")
+    token, symbol_like = q.upper(), is_symbol(q)
+    if symbol_like and "." in q:
+        return _run(token)
+    try:
+        found = (search or search_companies)(q)
+        if not isinstance(found, list):
+            raise SearchError("Yahoo's company search answered in a form this app does not understand.")
+    except Exception as exc:  # noqa: BLE001 - whatever went wrong, the typed text still gets its chance
+        why = str(exc) if isinstance(exc, SearchError) else "Yahoo's company search did not answer."
+        if symbol_like:
+            return _run(token, f"{why} So '{q}' was used as a ticker symbol. If it fails, type the company's ticker symbol.")
+        return _stop("warning", f"{why} Without it a company name cannot be looked up. Type the ticker symbol instead "
+                                f"({SYMBOL_HINT}), or try again in a minute.")
+    equities = [c for c in found if c["is_equity"]]
+    local = [c for c in equities if c["scope"] != "other"]          # US or Indian listings
+    exact = next((c for c in found if c["symbol"] == token), None) if symbol_like else None
+    notes = []
+    if exact is not None and not exact["is_equity"]:
+        notes.append(f"{exact['symbol']} ({exact['name']}) is {kind_text(exact['kind'])}, which this screen does not cover.")
+        exact = None
+    if exact is not None:
+        # The text is a ticker. Ask only if it could also mean something else: the same ticker on the NSE or BSE
+        # (TCS and TCS.NS), or a company whose name begins with it (ford: FORD is Forward Industries, F is Ford Motor).
+        word, own = q.casefold(), first_word(exact["name"])
+        rivals = [c for c in local if c["symbol"] != exact["symbol"]
+                  and (c["base"] == token or (first_word(c["name"]) == word and own != word))]
+        if not rivals:
+            return _run(exact["symbol"])
+        keep = {exact["symbol"]} | {c["symbol"] for c in rivals}
+        return _choose([c for c in found if c["symbol"] in keep], notes)
+    pool = local or equities
+    if not pool:
+        if notes:
+            return _stop("warning", f"{notes[0]} This screen works on individual companies: type a company name or a "
+                                    "stock's ticker symbol.")
+        if found:
+            other = found[0]
+            return _stop("warning", f"'{q}' matches {other['name']} ({other['symbol']}), which is {kind_text(other['kind'])}, "
+                                    "not a company. This screen works on individual companies: type a company name or a "
+                                    "stock's ticker symbol.")
+        if symbol_like:
+            return _run(token)                  # Yahoo has never heard of it: let the data fetch say so, as before
+        return _stop("warning", f"No listed company matched '{q}'. Check the spelling, try the full company name, or type "
+                                f"the ticker symbol ({SYMBOL_HINT}).")
+    hidden = len(equities) - len(local) if local else 0
+    if hidden:
+        notes.append(f"{hidden} listing{'s' if hidden != 1 else ''} on exchanges outside the US and India "
+                     f"{'was' if hidden == 1 else 'were'} left out. To analyse one, type its ticker with the exchange "
+                     "ending, for example 7203.T.")
+    if not local:
+        notes.append("These all trade outside the US and India. This screen is built for those two markets, so some "
+                     "checks may not fit.")
+        return _choose(pool, notes)
+    if len(pool) == 1:
+        cand = pool[0]
+        where = f", {cand['exchange']}" if cand["exchange"] else ""
+        return _run(cand["symbol"], " ".join([f"Searched for '{q}' and found {cand['name']} ({cand['symbol']}{where})."] + notes))
+    return _choose(pool, notes)
+
+
+def option_label(cand):
+    parts = [cand["name"], cand["symbol"]] + [x for x in (cand["exchange"], cand["industry"]) if x]
+    return md_plain(" · ".join(parts))
+
+
+def needs_lookup(cfg):
+    """Only the modes that take a company from the search box need its name settled."""
+    return cfg.get("mode") == MODE_PUBLIC or (cfg.get("mode") == MODE_VENTURE and cfg.get("source") == SRC_TICKER)
+
+
+def begin_run(cfg):
+    """A click on the run button: settle which company is meant, then start the run, ask, or explain."""
+    ss = st.session_state
+    for key in (LOOKUP_PENDING, LOOKUP_NOTICE, LOOKUP_NOTE):
+        ss.pop(key, None)
+    if not needs_lookup(cfg):
+        ss["active_cfg"] = cfg
+        return
+    query = cfg.get("query") or ""
+    with st.spinner(f"Looking up {md_plain(query)}..." if query else "Checking the search box..."):
+        verdict = decide_target(query)
+    if verdict["action"] == "run":
+        ss["active_cfg"] = {**cfg, "ticker": verdict["symbol"]}
+        if verdict.get("note"):
+            ss[LOOKUP_NOTE] = verdict["note"]
+        return
+    ss.pop("active_cfg", None)
+    if verdict["action"] == "choose":
+        ss[LOOKUP_PENDING] = {"query": query, "cfg": cfg, "options": verdict["options"], "more": verdict["more"],
+                              "notes": verdict["notes"]}
     else:
-        cfg["source"] = sb.radio("Data source", [SRC_MANUAL, SRC_TICKER])
+        ss[LOOKUP_NOTICE] = (verdict["kind"], verdict["text"])
+
+
+def choose_option(symbol):
+    """Button callback: run the company that was picked, with the settings in force when Run audit was clicked."""
+    ss = st.session_state
+    pending = ss.get(LOOKUP_PENDING)
+    if not pending or symbol not in {c["symbol"] for c in pending["options"]}:
+        return
+    for key in (LOOKUP_PENDING, LOOKUP_NOTICE, LOOKUP_NOTE):
+        ss.pop(key, None)
+    ss["active_cfg"] = {**pending["cfg"], "ticker": symbol}
+
+
+def show_lookup():
+    """The pick-one list, or the message left by the last click on the run button. True if anything was shown."""
+    ss = st.session_state
+    pending, notice = ss.get(LOOKUP_PENDING), ss.get(LOOKUP_NOTICE)
+    if pending:
+        st.subheader("Which company do you mean?")
+        st.caption(md_plain(f"'{pending['query']}' matches more than one listed company. Tap the one you want and the "
+                            "audit starts straight away."))
+        for i, cand in enumerate(pending["options"]):
+            st.button(option_label(cand), key=f"lookup_pick_{i}", on_click=choose_option, args=(cand["symbol"],))
+        if pending["more"]:
+            st.caption(f"{pending['more']} more matches are not shown. Type more of the name to narrow the list.")
+        for note in pending["notes"]:
+            st.caption(md_plain(note))
+    if notice:
+        getattr(st, notice[0])(md_plain(notice[1]))
+    return bool(pending or notice)
+
+
+def same_settings(active, cfg):
+    """True while the controls still hold the settings the results were made with. The symbol a run resolved to is left
+    out (typing 'apple' resolves to AAPL), and the typed text is compared without regard to case."""
+    def view(d):
+        rest = {k: v for k, v in d.items() if k not in ("ticker", "query")}
+        rest["query"] = str(d.get("query", "")).casefold()
+        return rest
+    return view(active) == view(cfg)
+
+
+RUN_LABEL, MACRO_LABEL = "Run audit", "Load backdrop"
+MODE_LABELS = {MODE_PUBLIC: "Stocks", MODE_VENTURE: "Pre-profit", MODE_MACRO: "Macro"}
+MODE_HELP = {
+    MODE_PUBLIC: "15-pillar quality screen for profitable listed companies in the US and India.",
+    MODE_VENTURE: "Venture lens for loss-making or early-stage companies: a listed ticker, or your own startup numbers.",
+    MODE_MACRO: "US and India rates, inflation and market readings side by side.",
+}
+MODE_KEY, MODE_LAST = "mode_pick", "mode_last"      # session-state keys: the switch's own value, and the last mode that was chosen
+
+
+def restore_mode():
+    """Callback for the mode switch. Tapping the chosen segment again clears it, so the last mode is put back and one
+    mode is always selected."""
+    ss = st.session_state
+    if ss.get(MODE_KEY) not in MODE_LABELS:
+        ss[MODE_KEY] = ss.get(MODE_LAST, MODE_PUBLIC)
+
+
+def pick_mode():
+    """The three-way mode switch at the top of the page. It is a segmented control where Streamlit has one, and a
+    horizontal radio on older versions."""
+    ss = st.session_state
+    modes = list(MODE_LABELS)
+    ss.setdefault(MODE_KEY, MODE_PUBLIC)
+    if hasattr(st, "segmented_control"):
+        options = dict(format_func=MODE_LABELS.get, key=MODE_KEY, on_change=restore_mode, label_visibility="collapsed")
+        try:
+            # Full width, so that all three labels fit (by default the control is only as wide as its content)
+            picked = st.segmented_control("Evaluation mode", modes, width="stretch", **options)
+        except Exception:       # noqa: BLE001 - a Streamlit whose segmented control has no width option, or not this value
+            picked = st.segmented_control("Evaluation mode", modes, **options)
+    else:
+        picked = st.radio("Evaluation mode", modes, format_func=MODE_LABELS.get, key=MODE_KEY, horizontal=True,
+                          label_visibility="collapsed")
+    mode = picked if picked in MODE_LABELS else ss.get(MODE_LAST, MODE_PUBLIC)
+    ss[MODE_LAST] = mode
+    return mode
+
+
+def controls():
+    """Everything the old sidebar held, on the page itself: the mode switch, the search box with its Run button (a form,
+    so the Go key on the phone keyboard runs it), and the optional settings folded away. Returns (cfg, clicked)."""
+    mode = pick_mode()
+    cfg = {"mode": mode}
+    st.caption(MODE_HELP[mode])
+    clicked = False
+    if mode == MODE_PUBLIC:
+        with st.form("run_public"):
+            cfg["query"] = clean_query(st.text_input(
+                "Company name or ticker", value="NVDA", placeholder="Apple, AAPL, Tata Motors, RELIANCE.NS",
+                help=f"Type a company name or a ticker symbol. {SYMBOL_HINT} If a name could mean more than one company, "
+                     "you will be asked which one."))
+            clicked = st.form_submit_button(RUN_LABEL, type="primary")
+        cfg["ticker"] = cfg["query"].upper()
+        # Settings sit outside the form, because the per-ticker widgets below take their keys from the typed text.
+        with st.expander("Settings"):
+            t_screen, t_value, t_macro, t_context = st.tabs(["Screen", "Valuation", "Macro", "Context"])
+            with t_screen:
+                cfg["loss_handling"] = st.selectbox(
+                    "If trailing net income is zero or negative", LOSS_OPTIONS,
+                    help=f"Auto sends loss-makers with revenue growth of {ROUTE_GROWTH_MIN:.0%} or more to the venture lens. "
+                         "Other loss-makers stay in the screen, where a hard gate caps them at Weak.")
+                cfg["allow_excluded"] = st.checkbox(
+                    "Run anyway for banks, insurers and REITs", value=False,
+                    help="The rubric does not fit these sectors. Results will be unreliable.")
+            with t_value:
+                cfg["mos"] = st.slider("Margin of safety", 0.05, 0.50, 0.20, 0.05)
+                cfg["req_return"] = st.slider("Required annual return", 0.08, 0.20, 0.10, 0.01)
+                cfg["growth_basis"] = st.selectbox("Growth basis", list(GROWTH_BASES))
+                cfg["max_growth"] = st.slider("Maximum growth assumed", 0.05, 0.40, 0.20, 0.01)
+                cfg["target_peg"] = st.slider("Target PEG for the exit multiple", 0.8, 2.5, 1.5, 0.1)
+                cfg["max_pe"] = st.slider("Maximum exit P/E", 12.0, 45.0, 30.0, 1.0)
+            with t_macro:
+                st.caption("Optional. Everything here is off by default. With both boxes unticked, scores and the forward "
+                           "valuation are exactly as before.")
+                cfg["link_r"] = st.checkbox(
+                    "Tie the required return to the 10-year yield", value=False, key="link_r",
+                    help="Required return = 10-year government yield + equity risk premium. US-dollar stocks use the US yield "
+                         "(live, or typed in below); Indian stocks use the India yield typed in below. The fixed slider "
+                         "under Valuation is the fallback when no yield is available.")
+                cfg["link_floor"] = st.checkbox(
+                    "Tie the exit-multiple floor to rates", value=False, key="link_floor",
+                    help=f"Replaces the fixed {MIN_PE:.0f}x floor with 1 / (required return - long-run growth), kept between "
+                         f"{FLOOR_PE_MIN:.0f}x and {FLOOR_PE_MAX:.0f}x.")
+                cfg["macro"] = macro_inputs()
+                cfg["reg_level"] = st.selectbox(
+                    "Regulatory or policy exposure (your view)", REG_LEVELS, key=f"reg_level_{cfg['ticker']}",
+                    help="Shown in the stress tests for this ticker. Never scored.")
+                cfg["reg_note"] = st.text_input("Regulation note (optional)", value="", max_chars=140,
+                                                key=f"reg_note_{cfg['ticker']}")
+            with t_context:
+                st.caption("Optional. Off by default. Adds a tab with the stock's sector against the market, trend health, how "
+                           "the sector held up in past sell-offs, an all-sector leaderboard, headlines and a research "
+                           "checklist. Information only: the rating never changes.")
+                cfg["show_context"] = st.checkbox(
+                    "Show the sector & market context tab", value=False, key="show_ctx",
+                    help="Fetches price history for the stock, its sector and the market from Yahoo Finance when you tap Run audit.")
+                cfg["ctx_board"] = st.checkbox(
+                    "Include the all-sector leaderboard", value=True, key="ctx_board",
+                    help="Ranks every sector by recent performance. Fetches about ten more price series on the first run "
+                         "(then cached for three hours); untick it if Yahoo is rate-limiting you.")
+                cfg["ctx_proxy"] = st.text_input(
+                    "Compare with this fund or index (optional)", value="", max_chars=20, key=f"ctx_proxy_{cfg['ticker']}",
+                    help="Blank = chosen from Yahoo's sector (US: the Select Sector SPDR funds; India: NSE sector indexes). "
+                         "For a narrower theme type a Yahoo symbol, for example XRT (US retail) or SMH (semiconductors).",
+                ).strip().upper()
+                cfg["ctx_date"] = st.text_input(
+                    "Catalyst date (optional, YYYY-MM-DD)", value="", max_chars=10, key=f"ctx_date_{cfg['ticker']}",
+                    help="If the stock moved on news, enter the date to see how far the stock, its sector and the market have "
+                         "moved since then, and how much of the move is still held. It also starts the filings list from "
+                         "that date.").strip()
+                cfg["ctx_alloc"] = st.checkbox(
+                    "Include capital-allocation numbers", value=True, key="ctx_alloc",
+                    help="Asset growth, capital spending against depreciation, cash paid for acquisitions, goodwill, debt "
+                         "and share-count changes, worked out from the annual statements the app has already loaded. "
+                         "No extra fetching.")
+                cfg["ctx_filings"] = st.checkbox(
+                    "Include recent SEC filings (US companies)", value=True, key="ctx_filings",
+                    help="Lists the company's recent 8-K reports (agreements, completed acquisitions, equity sales, officer "
+                         "changes and so on) from SEC EDGAR. Nothing is fetched until you give a contact email below.")
+                cfg["sec_contact"] = st.text_input(
+                    "Contact email for the SEC (needed for filings)", value="", max_chars=100, key="sec_contact",
+                    help="The SEC asks every automated request to carry a contact email. It is sent to the SEC with each "
+                         "request and nowhere else, and is kept only for your current session. You can also set SEC_CONTACT "
+                         "in the app's secrets.").strip()
+    elif mode == MODE_MACRO:
+        with st.expander("Assumptions and typed-in figures", expanded=True):
+            st.caption("US data loads automatically. For India, type the bond yield, policy rate and inflation in below.")
+            cfg["macro"] = macro_inputs()
+        clicked = st.button(MACRO_LABEL, type="primary")
+    else:
+        cfg["source"] = st.radio("Data source", [SRC_MANUAL, SRC_TICKER], horizontal=True)
         if cfg["source"] == SRC_TICKER:
-            cfg["ticker"] = sb.text_input("Ticker of a loss-making or growth company", value="CRWV").strip().upper()
-            cfg["nrr"] = sb.number_input("Net revenue retention % (0 = unknown)", 0, 200, 0, 5)
-            cfg["tam"] = sb.selectbox("TAM (your judgement, annual USD-equivalent)", TAM_CHOICES,
-                                      index=len(TAM_CHOICES) - 1)
+            with st.form("run_venture_ticker"):
+                cfg["query"] = clean_query(st.text_input(
+                    "Company name or ticker (loss-making or growth company)", value="CRWV",
+                    placeholder="CoreWeave, CRWV",
+                    help=f"Type a company name or a ticker symbol. {SYMBOL_HINT} If a name could mean more than one "
+                         "company, you will be asked which one."))
+                cfg["nrr"] = st.number_input("Net revenue retention % (0 = unknown)", 0, 200, 0, 5)
+                cfg["tam"] = st.selectbox("TAM (your judgement, annual USD-equivalent)", TAM_CHOICES,
+                                          index=len(TAM_CHOICES) - 1)
+                clicked = st.form_submit_button(RUN_LABEL, type="primary")
+            cfg["ticker"] = cfg["query"].upper()
         else:
-            cfg["name"] = sb.text_input("Company name", value="My SaaS Venture").strip()
-            cfg["sym"] = sb.selectbox("Currency symbol", ["$", "₹", "€", "£"])
-            cfg["arr"] = sb.number_input("Current ARR / revenue (millions)", min_value=0.1, value=10.0, step=1.0)
-            cfg["growth"] = sb.slider("YoY growth (%)", -20, 400, 85, 5)
-            cfg["gm"] = sb.slider("Gross margin (%)", 10, 95, 75, 5)
-            cfg["nrr"] = sb.slider("Net revenue retention (%)", 70, 160, 115, 5)
-            cfg["tam"] = sb.selectbox("TAM (annual USD-equivalent)", TAM_CHOICES, index=0)
-            cfg["cash"] = sb.number_input("Cash on hand (millions)", min_value=0.0, value=12.0, step=1.0)
-            cfg["burn"] = sb.number_input("Annual net burn (millions; negative = cash-generative)", value=6.0, step=1.0)
-        with sb.expander("Projection assumptions"):
+            with st.form("run_venture_manual"):
+                cfg["name"] = st.text_input("Company name", value="My SaaS Venture").strip()
+                cfg["sym"] = st.selectbox("Currency symbol", ["$", "₹", "€", "£"])
+                cfg["arr"] = st.number_input("Current ARR / revenue (millions)", min_value=0.1, value=10.0, step=1.0)
+                cfg["growth"] = st.slider("YoY growth (%)", -20, 400, 85, 5)
+                cfg["gm"] = st.slider("Gross margin (%)", 10, 95, 75, 5)
+                cfg["nrr"] = st.slider("Net revenue retention (%)", 70, 160, 115, 5)
+                cfg["tam"] = st.selectbox("TAM (annual USD-equivalent)", TAM_CHOICES, index=0)
+                cfg["cash"] = st.number_input("Cash on hand (millions)", min_value=0.0, value=12.0, step=1.0)
+                cfg["burn"] = st.number_input("Annual net burn (millions; negative = cash-generative)", value=6.0, step=1.0)
+                clicked = st.form_submit_button(RUN_LABEL, type="primary")
+        with st.expander("Projection assumptions"):
             cfg["fade"] = st.slider("Growth fade per year", 0.5, 1.0, DEFAULT_FADE, 0.05,
                                     help="Growth in year t = starting growth x fade^t.")
             cfg["cost_ratio"] = st.slider("Cost growth as a share of revenue growth", 0.2, 1.0, DEFAULT_COST_RATIO, 0.05,
                                           help="Lower means more operating leverage.")
-    clicked = sb.button("Load backdrop 🌍" if mode == MODE_MACRO else "Run audit 🚀", type="primary")
-    sb.caption("Screening tool for research and education. Not investment advice.")
     return cfg, clicked
 
 
 def load(ticker):
     if not ticker:
-        raise DataError("Enter a ticker symbol in the sidebar, then click Run audit.")
+        raise DataError("Type a company name or a ticker symbol in the search box, then tap Run audit.")
     with st.spinner(f"Fetching Yahoo Finance data for {ticker}..."):
         return fetch_snapshot(ticker)
 
@@ -3253,11 +4078,14 @@ def run_public(cfg):
     if rule and rule[0] == "exclude" and not cfg["allow_excluded"]:
         render_excluded(m, rule[1])
         return
+    if m.get("reduced") and m["sector"] == "Unknown" and not cfg["allow_excluded"]:
+        render_unverified(m)       # without a sector the bank / insurer / REIT rule cannot run, so no rating is issued
+        return
     if m["ni_ttm"] is not None and m["ni_ttm"] <= 0:
         growth = coalesce(m["rev_growth_yoy"], m["rev_cagr"])
         choice = cfg["loss_handling"]
         if choice == LOSS_VENTURE:
-            why = "the sidebar is set to always use the venture lens"
+            why = "your Settings say to always use the venture lens"
             to_venture = True
         elif choice == LOSS_AUTO and growth is not None and growth >= ROUTE_GROWTH_MIN:
             why = f"revenue is growing {growth * 100:.0f}%"
@@ -3266,12 +4094,14 @@ def run_public(cfg):
             to_venture = False
         if to_venture:
             say("warning", f"**Routed to the venture lens.** {m['name']} has negative trailing net income and {why}, "
-                           "so profit-based metrics do not apply. Switch to venture mode in the sidebar to add NRR, "
+                           "so profit-based metrics do not apply. Switch to the Pre-profit mode at the top to add NRR, "
                            "TAM or change the projection assumptions.")
+            if m.get("reduced"):
+                show_reduced(m["reduced"])
             render_venture(venture_inputs_from_snapshot(snap), DEFAULT_FADE, DEFAULT_COST_RATIO)
             return
         if choice == LOSS_SCREEN:
-            say("warning", "**Trailing net income is negative.** The sidebar is set to always run the quality screen, "
+            say("warning", "**Trailing net income is negative.** Your Settings say to always run the quality screen, "
                            "so the loss-making gate caps the result at Weak.")
         else:
             say("warning", "**Trailing net income is negative and growth is below the venture-routing threshold "
@@ -3283,6 +4113,8 @@ def run_public(cfg):
 def run_venture(cfg):
     if cfg["source"] == SRC_TICKER:
         snap = load(cfg["ticker"])
+        if snap.get("reduced"):
+            show_reduced(snap["reduced"])
         vi = venture_inputs_from_snapshot(
             snap,
             nrr=cfg["nrr"] / 100 if cfg["nrr"] else None,
@@ -3307,23 +4139,24 @@ def run_macro(cfg):
 
 
 def main():
-    st.title("🛡️ Anti-Fragile Stock & Startup Screener")
-    st.markdown(
-        "A **15-pillar screen** for profitable listed companies and a **venture lens** for pre-profit and growth "
-        "companies. Missing data is shown as *n/a* and left out of the score. It is never invented. An optional "
-        "**macro overlay** (rate links, stress tests and a US and India backdrop) and an optional **sector & market "
-        "context** tab (with capital-allocation numbers and recent SEC filings) are off by default."
-    )
-    cfg, clicked = sidebar()
+    show_html(f"<style>{STYLE}</style>{brand_html()}")
+    cfg, clicked = controls()
     if clicked:
-        st.session_state["active_cfg"] = cfg
+        begin_run(cfg)
+    asked = show_lookup()
     active = st.session_state.get("active_cfg")
+    if active and active.get("mode") != cfg["mode"]:
+        active = None       # a result from another mode stays stored, but is not shown under this mode's controls
 
     if not active:
-        say("info", "👈 Choose a mode and a target in the sidebar, then click the button at the bottom of the sidebar.")
+        if not asked:
+            show_html(empty_html(cfg["mode"]))
     else:
-        if active != cfg:
-            st.caption("Sidebar settings changed since the last run. Click the button again to refresh the results.")
+        if not same_settings(active, cfg):
+            st.caption("Settings changed since the last run. Tap "
+                       f"{MACRO_LABEL if cfg['mode'] == MODE_MACRO else RUN_LABEL} again to refresh the results.")
+        if st.session_state.get(LOOKUP_NOTE):
+            st.caption(md_plain(st.session_state[LOOKUP_NOTE]))
         try:
             if active["mode"] == MODE_PUBLIC:
                 run_public(active)
@@ -3331,6 +4164,10 @@ def main():
                 run_macro(active)
             else:
                 run_venture(active)
+        except YahooUnavailable as exc:
+            say("error", str(exc))
+            with st.expander("Technical details"):
+                st.markdown("\n".join(f"- {md_plain(line)}" for line in exc.details) or "Nothing more was recorded.")
         except DataError as exc:
             say("error", str(exc))
         except Exception as exc:  # noqa: BLE001 - show any data or network problem instead of a blank page
@@ -3373,11 +4210,24 @@ def main():
             "and not scored.\n"
             "- **Venture projection:** revenue growth fades each year while the cost base grows more slowly, "
             "which gives a breakeven year and a funding gap. It is a what-if tool, not a forecast.\n"
+            "- **Finding a company:** type a company name or a ticker symbol. Names are matched by Yahoo Finance's own "
+            "search, limited to US and Indian listings, and a name that could mean more than one company shows a "
+            "pick-one list instead of guessing. A ticker with an exchange ending (TCS.NS) is used exactly as typed, and "
+            "if the search cannot be reached your text is used as a ticker. Finding the company never changes a "
+            "score, a label or a gate.\n"
             "- **Data:** Yahoo Finance via yfinance is unofficial and can be incomplete or delayed. "
-            "Compare the *Inputs used* tab with the company's filings."
+            "Compare the *Inputs* tab with the company's filings.\n"
+            "- **Reduced-data mode:** Yahoo sometimes refuses its quote service to shared cloud servers such as the one "
+            "this app runs on. The app then rebuilds a rougher snapshot from the annual statements, the daily price "
+            "history and Yahoo's search service, and says so in a yellow notice. The price is the last daily close, "
+            "the market cap uses the latest annual share count, P/E uses annual earnings per share, and the analyst and "
+            "insider pillars are left out. A symbol whose sector cannot be confirmed is not rated unless you turn on the "
+            f"Run anyway box, and a last price more than {REBUILD_STALE_DAYS} days old is treated as a delisted symbol."
         )
     st.caption(DISCLAIMER)
-    st.caption(f"App version {APP_VERSION}.")
+    st.caption(f"App version {APP_VERSION}. Running Streamlit {lib_version(st)} and yfinance {lib_version(yf)}. "
+               "On an iPhone, tap Share in Safari and then Add to Home Screen to open it like an app.")
+    show_html('<div class="sa-end"></div>')       # room below the last line, so the host's floating badges do not cover it
 
 
 if __name__ == "__main__":
